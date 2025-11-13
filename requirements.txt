@@ -1,0 +1,19 @@
+# Wymagane biblioteki Python dla GFS Downloader
+
+# Podstawowe biblioteki
+xarray==2024.1.0
+pandas==2.2.0
+requests==2.31.0
+
+# Baza danych
+sqlalchemy==2.0.25
+pymysql==1.1.0
+
+# Obsługa plików GRIB2
+cfgrib==0.9.10.4
+eccodes==1.6.1
+
+# Dodatkowe zależności
+numpy==1.26.3
+netcdf4==1.6.5
+tqdm==4.66.1  # Progress bar dla PROFESSIONAL VERSION
