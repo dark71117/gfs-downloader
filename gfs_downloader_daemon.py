@@ -56,9 +56,16 @@ DETAILED_LOG_FILE = os.path.join(LOG_DIR, f"gfs_daemon_detailed_{datetime.now().
 # Plik logów z błędami
 ERROR_LOG_FILE = os.path.join(LOG_DIR, f"gfs_daemon_errors_{datetime.now().strftime('%Y%m%d')}.log")
 
+# Wycisz logi DEBUG z bibliotek zewnętrznych (przed konfiguracją głównego loggera)
+logging.getLogger('cfgrib').setLevel(logging.WARNING)
+logging.getLogger('ecmwf').setLevel(logging.WARNING)
+logging.getLogger('eccodes').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+
 # Konfiguracja głównego loggera (konsola + główny plik)
 logging.basicConfig(
-    level=logging.DEBUG,  # Zmieniono na DEBUG, żeby widzieć wszystkie komunikaty
+    level=logging.INFO,  # Zmieniono na INFO - DEBUG tylko dla naszego kodu
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE, encoding='utf-8'),
@@ -67,7 +74,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Upewnij się, że DEBUG jest włączony
+logger.setLevel(logging.INFO)  # INFO dla głównego loggera
 
 # Szczegółowy logger (wszystkie operacje)
 detailed_logger = logging.getLogger('detailed')

@@ -24,11 +24,15 @@ warnings.filterwarnings('ignore')
 
 # Stłum błędy ECCODES (są tylko ostrzeżeniami)
 os.environ['ECCODES_LOG_VERBOSITY'] = '0'
+os.environ['ECCODES_DEBUG'] = '0'
 
-# Wycisz logi DEBUG z cfgrib i ecmwf (niepotrzebne dla użytkownika)
+# Wycisz logi DEBUG z cfgrib, ecmwf, eccodes, urllib3, requests (niepotrzebne dla użytkownika)
 logging.getLogger('cfgrib').setLevel(logging.WARNING)
 logging.getLogger('ecmwf').setLevel(logging.WARNING)
 logging.getLogger('eccodes').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
 
 # Logger dla modułu (będzie używał root logger jeśli nie jest skonfigurowany)
 module_logger = logging.getLogger(__name__)
@@ -741,17 +745,33 @@ class ForecastDownloader:
             # Parsuj GRIB2
             all_datasets = []
             
-            # Wycisz logi cfgrib podczas parsowania
+            # Wycisz logi cfgrib i eccodes podczas parsowania
             cfgrib_logger = logging.getLogger('cfgrib')
-            original_level = cfgrib_logger.level
-            cfgrib_logger.setLevel(logging.WARNING)
+            eccodes_logger = logging.getLogger('eccodes')
+            ecmwf_logger = logging.getLogger('ecmwf')
+            original_cfgrib_level = cfgrib_logger.level
+            original_eccodes_level = eccodes_logger.level
+            original_ecmwf_level = ecmwf_logger.level
+            
+            cfgrib_logger.setLevel(logging.ERROR)  # Tylko błędy
+            eccodes_logger.setLevel(logging.ERROR)  # Tylko błędy
+            ecmwf_logger.setLevel(logging.ERROR)  # Tylko błędy
+            
+            # Wycisz również root logger dla tych modułów
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers:
+                if hasattr(handler, 'setLevel'):
+                    # Nie zmieniamy poziomu handlera, tylko loggerów
+                    pass
             
             try:
-                for flt_cfg in self.filters_config:
+                module_logger.info(f"thr: {thread_id} - Rozpoczynam parsowanie GRIB2 dla f{forecast_hour:03d}")
+                for idx, flt_cfg in enumerate(self.filters_config, 1):
                     try:
                         # Stłum błędy ECCODES podczas parsowania
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore")
+                            module_logger.debug(f"thr: {thread_id} - Parsowanie {flt_cfg['name']} ({idx}/{len(self.filters_config)}) dla f{forecast_hour:03d}")
                             ds = xr.open_dataset(
                                 temp_file, 
                                 engine='cfgrib',
@@ -762,6 +782,7 @@ class ForecastDownloader:
                                 }
                             )
                             
+                            module_logger.debug(f"thr: {thread_id} - Wycinanie regionu dla {flt_cfg['name']} f{forecast_hour:03d}")
                             ds_region = ds.sel(
                                 latitude=slice(self.lat_max, self.lat_min),
                                 longitude=slice(self.lon_min, self.lon_max)
@@ -772,15 +793,25 @@ class ForecastDownloader:
                                 'dataset': ds_region,
                                 'vars': flt_cfg['vars']
                             })
+                            module_logger.debug(f"thr: {thread_id} - ✓ {flt_cfg['name']} sparsowany dla f{forecast_hour:03d}")
                             
                     except Exception as e:
                         # Ignoruj błędy parsowania - niektóre pliki mogą mieć problemy
+                        module_logger.debug(f"thr: {thread_id} - Błąd parsowania {flt_cfg['name']} dla f{forecast_hour:03d}: {e}")
                         continue
             finally:
-                # Przywróć oryginalny poziom logowania cfgrib
-                cfgrib_logger.setLevel(original_level)
+                # Przywróć oryginalny poziom logowania
+                cfgrib_logger.setLevel(original_cfgrib_level)
+                eccodes_logger.setLevel(original_eccodes_level)
+                ecmwf_logger.setLevel(original_ecmwf_level)
+                module_logger.info(f"thr: {thread_id} - Zakończono parsowanie GRIB2 dla f{forecast_hour:03d} - znaleziono {len(all_datasets)} datasetów")
             
             # Konwertuj do DataFrame
+            if len(all_datasets) == 0:
+                module_logger.warning(f"thr: {thread_id} - Brak datasetów po parsowaniu f{forecast_hour:03d}")
+                return (False, forecast_info, None)
+            
+            module_logger.info(f"thr: {thread_id} - Konwertuję {len(all_datasets)} datasetów do DataFrame dla f{forecast_hour:03d}")
             df = None
             
             for ds_info in all_datasets:
