@@ -64,9 +64,14 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
 
 # Konfiguracja głównego loggera (konsola + główny plik)
+# Format z datą i godziną na początku
+log_format = '%(asctime)s - %(levelname)s - %(message)s'
+date_format = '%Y-%m-%d %H:%M:%S'
+
 logging.basicConfig(
     level=logging.INFO,  # Zmieniono na INFO - DEBUG tylko dla naszego kodu
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format=log_format,
+    datefmt=date_format,
     handlers=[
         logging.FileHandler(LOG_FILE, encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
@@ -80,7 +85,7 @@ logger.setLevel(logging.INFO)  # INFO dla głównego loggera
 detailed_logger = logging.getLogger('detailed')
 detailed_logger.setLevel(logging.DEBUG)
 detailed_handler = logging.FileHandler(DETAILED_LOG_FILE, encoding='utf-8')
-detailed_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+detailed_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt=date_format))
 detailed_logger.addHandler(detailed_handler)
 detailed_logger.propagate = False
 
@@ -88,13 +93,100 @@ detailed_logger.propagate = False
 error_logger = logging.getLogger('errors')
 error_logger.setLevel(logging.ERROR)
 error_handler = logging.FileHandler(ERROR_LOG_FILE, encoding='utf-8')
-error_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+error_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt=date_format))
 error_logger.addHandler(error_handler)
 error_logger.propagate = False
 
 # === KONFIGURACJA ===
 CHECK_INTERVAL = 1200  # 20 minut w sekundach
 WAIT_BETWEEN_ATTEMPTS = 60  # sekund między próbami pobierania
+NETWORK_ERROR_RETRY_INTERVAL = 300  # 5 minut przy błędach sieciowych
+MAX_NETWORK_ERRORS = 10  # Maksymalna liczba kolejnych błędów sieciowych przed dłuższą przerwą
+KEEP_ALIVE_INTERVAL = 300  # 5 minut - zapisuje plik keep-alive żeby dysk się nie usypiał
+
+def check_internet_connection():
+    """
+    Sprawdza czy połączenie internetowe działa.
+    Zwraca True jeśli działa, False w przeciwnym razie.
+    """
+    test_urls = [
+        "https://www.google.com",
+        "https://nomads.ncep.noaa.gov",
+        "https://8.8.8.8"  # Google DNS jako backup
+    ]
+    
+    for url in test_urls:
+        try:
+            response = requests.head(url, timeout=5, allow_redirects=True)
+            if response.status_code in [200, 301, 302, 303, 307, 308]:
+                return True
+        except (requests.exceptions.RequestException, 
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                Exception) as e:
+            continue
+    
+    return False
+
+def is_network_error(exception):
+    """
+    Sprawdza czy błąd jest związany z siecią.
+    """
+    error_str = str(exception).lower()
+    error_type = type(exception).__name__
+    
+    network_errors = [
+        'nameresolutionerror',
+        'getaddrinfo failed',
+        'connectionerror',
+        'timeout',
+        'max retries exceeded',
+        'failed to resolve',
+        'network is unreachable',
+        'no route to host'
+    ]
+    
+    if any(err in error_str for err in network_errors):
+        return True
+    
+    if 'ConnectionError' in error_type or 'Timeout' in error_type:
+        return True
+    
+    return False
+
+def write_keep_alive():
+    """
+    Zapisuje plik keep-alive żeby dysk się nie usypiał i daemon był aktywny.
+    """
+    try:
+        keep_alive_file = os.path.join('logs', 'daemon_keep_alive.txt')
+        with open(keep_alive_file, 'w', encoding='utf-8') as f:
+            f.write(f"Daemon aktywny: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            f.write(f"PID: {os.getpid()}\n")
+        return True
+    except Exception as e:
+        logger.debug(f"Błąd zapisu keep-alive: {e}")
+        return False
+
+def sleep_with_keep_alive(seconds, last_keep_alive_ref):
+    """
+    Czeka określoną liczbę sekund, ale co 30 sekund zapisuje keep-alive.
+    Zapobiega usypianiu dysku podczas długiego czekania.
+    """
+    start_time = datetime.utcnow()
+    check_interval = 30  # Sprawdzaj co 30 sekund
+    
+    while (datetime.utcnow() - start_time).total_seconds() < seconds:
+        sleep_time = min(check_interval, seconds - (datetime.utcnow() - start_time).total_seconds())
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        
+        # Sprawdź czy trzeba zapisać keep-alive
+        current_time = datetime.utcnow()
+        if last_keep_alive_ref[0] is None or (current_time - last_keep_alive_ref[0]).total_seconds() >= KEEP_ALIVE_INTERVAL:
+            write_keep_alive()
+            last_keep_alive_ref[0] = current_time
+            detailed_logger.debug(f"Keep-alive zapisany podczas czekania: {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
 def load_config():
     """Wczytuje konfigurację z config.ini"""
@@ -347,6 +439,8 @@ def download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
     total_success = 0
     total_failed = 0
     total_records = 0
+    total_files = 0
+    total_bytes = 0
     
     while True:
         try:
@@ -386,7 +480,7 @@ def download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
             # Przygotuj kolejki i statystyki
             download_queue = queue.Queue()
             progress_queue = queue.Queue()
-            stats = {'success': 0, 'failed': 0, 'total_records': 0}
+            stats = {'success': 0, 'failed': 0, 'total_records': 0, 'total_bytes': 0}
             currently_processing = set()
             
             # Dodaj prognozy do kolejki
@@ -452,8 +546,9 @@ def download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
                         if progress['success']:
                             successful_forecasts.append(forecast_hour)
                             records = progress.get('total_records', 0)
-                            logger.info(f"✓ Pobrano f{forecast_hour:03d} - {records} rekordów")
-                            detailed_logger.info(f"thr: {thread_id} - ✓ Pobrano f{forecast_hour:03d} - {records} rekordów")
+                            file_size_mb = progress.get('file_size_bytes', 0) / (1024 * 1024)
+                            logger.info(f"✓ Pobrano f{forecast_hour:03d} - {records} rekordów ({file_size_mb:.2f} MB)")
+                            detailed_logger.info(f"thr: {thread_id} - ✓ Pobrano f{forecast_hour:03d} - {records} rekordów ({file_size_mb:.2f} MB)")
                         else:
                             failed_forecasts.append(forecast_hour)
                             logger.warning(f"✗ Błąd pobierania f{forecast_hour:03d}")
@@ -491,14 +586,18 @@ def download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
             total_success += stats['success']
             total_failed += stats['failed']
             total_records += stats['total_records']
+            total_files += stats['success']  # Liczba pobranych plików
+            total_bytes += stats.get('total_bytes', 0)
             
             logger.info(f"Próba #{attempt}: Pobrano {stats['success']}, błędów: {stats['failed']}")
             
             # Szczegółowe logowanie wyników próby
+            stats_mb = stats.get('total_bytes', 0) / (1024 * 1024)
             detailed_logger.info(f"=== PRÓBA #{attempt} ZAKOŃCZONA ===")
-            detailed_logger.info(f"Pobrano: {stats['success']} prognoz")
+            detailed_logger.info(f"Pobrano: {stats['success']} prognoz ({stats['success']} plików)")
             detailed_logger.info(f"Błędów: {stats['failed']} prognoz")
             detailed_logger.info(f"Rekordów w bazie: {stats['total_records']}")
+            detailed_logger.info(f"Pobrano danych: {stats_mb:.2f} MB")
             
             if successful_forecasts:
                 success_list = sorted(successful_forecasts)
@@ -553,7 +652,8 @@ def download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
             
         except KeyboardInterrupt:
             logger.warning("Przerwano przez użytkownika (Ctrl+C)")
-            logger.info(f"Pobrano łącznie: {total_success} prognoz w {attempt-1} próbach")
+            total_mb_interrupted = total_bytes / (1024 * 1024)
+            logger.info(f"Pobrano łącznie: {total_success} prognoz ({total_files} plików, {total_mb_interrupted:.2f} MB) w {attempt-1} próbach")
             break
         except Exception as e:
             logger.error(f"Błąd podczas pobierania: {e}", exc_info=True)
@@ -561,15 +661,18 @@ def download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
             time.sleep(WAIT_BETWEEN_ATTEMPTS)
             attempt += 1
     
+    total_mb = total_bytes / (1024 * 1024)
     logger.info(f"Pobieranie zakończone: {total_success} sukcesów, {total_failed} błędów, {total_records} rekordów")
+    logger.info(f"📊 STATYSTYKI: Pobrano {total_files} plików, łącznie {total_mb:.2f} MB danych")
     
     # Podsumowanie całego pobierania
     detailed_logger.info("=" * 70)
     detailed_logger.info(f"=== POBRANIE ZAKOŃCZONE DLA RUN {run_time.strftime('%Y-%m-%d %H:00')} UTC ===")
     detailed_logger.info(f"Łącznie prób: {attempt-1}")
-    detailed_logger.info(f"Pobrano: {total_success} prognoz")
+    detailed_logger.info(f"Pobrano: {total_success} prognoz ({total_files} plików)")
     detailed_logger.info(f"Błędów: {total_failed} prognoz")
     detailed_logger.info(f"Rekordów w bazie: {total_records}")
+    detailed_logger.info(f"📊 STATYSTYKI: Pobrano {total_files} plików, łącznie {total_mb:.2f} MB danych")
     
     # Sprawdź końcowy stan
     try:
@@ -681,7 +784,7 @@ def download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
             detailed_logger.error(f"Błąd podczas czyszczenia starych runów: {e}", exc_info=True)
             error_logger.error(f"Błąd podczas czyszczenia starych runów: {e}", exc_info=True)
     
-    return total_success, total_failed, total_records
+    return total_success, total_failed, total_records, total_files, total_bytes
 
 def main_daemon_loop():
     """Główna pętla daemona"""
@@ -721,14 +824,57 @@ def main_daemon_loop():
     
     last_run_in_db = None
     last_check_time = None
+    network_error_count = 0  # Licznik kolejnych błędów sieciowych
+    last_network_check = None
+    last_keep_alive = [None]  # Ostatni czas zapisu keep-alive (lista żeby można było modyfikować w funkcji)
     
     logger.info("\n🚀 Daemon uruchomiony. Działa w tle...")
     logger.info("   (Naciśnij Ctrl+C aby zatrzymać)\n")
+    
+    # Zapisz pierwszy keep-alive
+    write_keep_alive()
     
     try:
         while True:
             try:
                 current_time = datetime.utcnow()
+                
+                # Keep-alive: zapisz plik co 5 minut żeby dysk się nie usypiał
+                if last_keep_alive[0] is None or (current_time - last_keep_alive[0]).total_seconds() >= KEEP_ALIVE_INTERVAL:
+                    write_keep_alive()
+                    last_keep_alive[0] = current_time
+                    detailed_logger.debug(f"Keep-alive zapisany: {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                
+                # Sprawdź połączenie internetowe przed sprawdzaniem danych (co 5 minut lub przy błędach)
+                should_check_network = (
+                    last_network_check is None or 
+                    (current_time - last_network_check).total_seconds() >= 300 or
+                    network_error_count > 0
+                )
+                
+                if should_check_network:
+                    if not check_internet_connection():
+                        network_error_count += 1
+                        logger.warning(f"⚠️  Brak połączenia internetowego (błąd #{network_error_count})")
+                        detailed_logger.warning(f"Brak połączenia internetowego - błąd #{network_error_count}")
+                        
+                        if network_error_count >= MAX_NETWORK_ERRORS:
+                            wait_time = NETWORK_ERROR_RETRY_INTERVAL * 2  # 10 minut
+                            logger.warning(f"⚠️  Wiele błędów sieciowych ({network_error_count}). Czekam {wait_time/60:.0f} minut...")
+                            detailed_logger.warning(f"Wiele błędów sieciowych - czekam {wait_time/60:.0f} minut")
+                            sleep_with_keep_alive(wait_time, last_keep_alive)
+                        else:
+                            logger.info(f"⏳ Czekam {NETWORK_ERROR_RETRY_INTERVAL/60:.0f} minut przed ponowną próbą...")
+                            sleep_with_keep_alive(NETWORK_ERROR_RETRY_INTERVAL, last_keep_alive)
+                        
+                        last_network_check = current_time
+                        continue  # Pomiń sprawdzanie danych
+                    else:
+                        if network_error_count > 0:
+                            logger.info(f"✓ Połączenie internetowe przywrócone! (było {network_error_count} błędów)")
+                            detailed_logger.info(f"Połączenie internetowe przywrócone po {network_error_count} błędach")
+                        network_error_count = 0  # Reset licznika
+                        last_network_check = current_time
                 
                 # Sprawdź czy minął interwał
                 if last_check_time is None or (current_time - last_check_time).total_seconds() >= CHECK_INTERVAL:
@@ -737,7 +883,25 @@ def main_daemon_loop():
                     detailed_logger.info(f"SPRAWDZANIE NOWYCH DANYCH - {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
                     detailed_logger.info(f"{'='*70}")
                     
-                    run_time, RUN_DATE, RUN_HOUR, last_run_in_db = check_for_new_run(engine, last_run_in_db)
+                    try:
+                        run_time, RUN_DATE, RUN_HOUR, last_run_in_db = check_for_new_run(engine, last_run_in_db)
+                    except Exception as e:
+                        if is_network_error(e):
+                            network_error_count += 1
+                            logger.warning(f"⚠️  Błąd sieciowy podczas sprawdzania danych: {e}")
+                            detailed_logger.warning(f"Błąd sieciowy: {e}")
+                            error_logger.error(f"Błąd sieciowy podczas sprawdzania danych: {e}")
+                            
+                            if network_error_count >= MAX_NETWORK_ERRORS:
+                                wait_time = NETWORK_ERROR_RETRY_INTERVAL * 2
+                                logger.warning(f"⚠️  Wiele błędów sieciowych. Czekam {wait_time/60:.0f} minut...")
+                                sleep_with_keep_alive(wait_time, last_keep_alive)
+                            else:
+                                logger.info(f"⏳ Czekam {NETWORK_ERROR_RETRY_INTERVAL/60:.0f} minut...")
+                                sleep_with_keep_alive(NETWORK_ERROR_RETRY_INTERVAL, last_keep_alive)
+                            continue
+                        else:
+                            raise  # Rzuć dalej jeśli to nie błąd sieciowy
                     
                     if run_time is not None:
                         logger.info(f"✓ Znaleziono run do pobrania: {run_time.strftime('%Y-%m-%d %H:00')} UTC")
@@ -764,16 +928,33 @@ def main_daemon_loop():
                         
                         # Pobierz wszystkie prognozy
                         try:
-                            success, failed, records = download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine)
+                            success, failed, records, files, bytes_downloaded = download_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine)
                             
                             # Zaktualizuj last_run_in_db
                             last_run_in_db = run_time
                             
+                            mb_downloaded = bytes_downloaded / (1024 * 1024)
                             logger.info(f"✓✓✓ Pobieranie zakończone: {success} sukcesów, {failed} błędów")
+                            logger.info(f"📊 STATYSTYKI: Pobrano {files} plików, łącznie {mb_downloaded:.2f} MB danych, {records} rekordów w bazie")
                         except Exception as e:
-                            logger.error(f"KRYTYCZNY BŁĄD podczas pobierania prognoz: {e}", exc_info=True)
-                            error_logger.error(f"KRYTYCZNY BŁĄD podczas pobierania prognoz dla run {run_time}: {e}", exc_info=True)
-                            detailed_logger.error(f"KRYTYCZNY BŁĄD podczas pobierania prognoz: {e}", exc_info=True)
+                            if is_network_error(e):
+                                network_error_count += 1
+                                logger.warning(f"⚠️  Błąd sieciowy podczas pobierania: {e}")
+                                detailed_logger.warning(f"Błąd sieciowy podczas pobierania: {e}")
+                                error_logger.error(f"Błąd sieciowy podczas pobierania prognoz: {e}")
+                                
+                                if network_error_count >= MAX_NETWORK_ERRORS:
+                                    wait_time = NETWORK_ERROR_RETRY_INTERVAL * 2
+                                    logger.warning(f"⚠️  Wiele błędów sieciowych. Czekam {wait_time/60:.0f} minut...")
+                                    sleep_with_keep_alive(wait_time, last_keep_alive)
+                                else:
+                                    logger.info(f"⏳ Czekam {NETWORK_ERROR_RETRY_INTERVAL/60:.0f} minut przed ponowną próbą...")
+                                    sleep_with_keep_alive(NETWORK_ERROR_RETRY_INTERVAL, last_keep_alive)
+                            else:
+                                logger.error(f"KRYTYCZNY BŁĄD podczas pobierania prognoz: {e}", exc_info=True)
+                                error_logger.error(f"KRYTYCZNY BŁĄD podczas pobierania prognoz dla run {run_time}: {e}", exc_info=True)
+                                detailed_logger.error(f"KRYTYCZNY BŁĄD podczas pobierania prognoz: {e}", exc_info=True)
+                            
                             # Kontynuuj działanie daemona zamiast się wyłączać
                             logger.info("Kontynuuję działanie daemona...")
                     else:
@@ -785,15 +966,28 @@ def main_daemon_loop():
                     logger.info(f"Następne sprawdzenie za {CHECK_INTERVAL/60:.0f} minut ({next_check.strftime('%Y-%m-%d %H:%M:%S')} UTC)...\n")
                     detailed_logger.info(f"Następne sprawdzenie: {next_check.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
                 
-                # Czekaj 1 minutę przed następnym sprawdzeniem
-                time.sleep(60)
+                # Czekaj 1 minutę przed następnym sprawdzeniem (z keep-alive)
+                sleep_with_keep_alive(60, last_keep_alive)
                 
             except KeyboardInterrupt:
                 logger.info("\n⚠️  Zatrzymywanie daemona...")
                 break
             except Exception as e:
-                logger.error(f"Błąd w głównej pętli: {e}", exc_info=True)
-                time.sleep(60)  # Czekaj przed ponowną próbą
+                if is_network_error(e):
+                    network_error_count += 1
+                    logger.warning(f"⚠️  Błąd sieciowy w głównej pętli: {e}")
+                    detailed_logger.warning(f"Błąd sieciowy w głównej pętli: {e}")
+                    
+                    if network_error_count >= MAX_NETWORK_ERRORS:
+                        wait_time = NETWORK_ERROR_RETRY_INTERVAL * 2
+                        logger.warning(f"⚠️  Wiele błędów sieciowych. Czekam {wait_time/60:.0f} minut...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.info(f"⏳ Czekam {NETWORK_ERROR_RETRY_INTERVAL/60:.0f} minut...")
+                        time.sleep(NETWORK_ERROR_RETRY_INTERVAL)
+                else:
+                    logger.error(f"Błąd w głównej pętli: {e}", exc_info=True)
+                    sleep_with_keep_alive(60, last_keep_alive)  # Czekaj przed ponowną próbą
                 
     except KeyboardInterrupt:
         logger.info("\n⚠️  Daemon zatrzymany przez użytkownika")
@@ -807,6 +1001,7 @@ def main_daemon_loop():
         detailed_logger.error(f"Krytyczny błąd w głównej pętli daemona: {e}", exc_info=True)
         # Nie kończ programu - spróbuj kontynuować
         logger.info("Próbuję kontynuować działanie daemona...")
+        # Użyj zwykłego sleep bo to jest w finally
         time.sleep(60)  # Poczekaj przed ponowną próbą
     finally:
         logger.info("Daemon zakończony")

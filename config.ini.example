@@ -1,0 +1,22 @@
+# Przykładowy plik konfiguracyjny dla GFS Downloader
+# Skopiuj ten plik jako config.ini i dostosuj ustawienia
+
+[database]
+# Ustawienia bazy danych MySQL
+user = root
+password = 
+host = localhost
+database = dane_gfs
+
+[region]
+# Region do pobierania danych (Polska i okolice)
+# Współrzędne: szerokość i długość geograficzna
+lat_min = 49.0
+lat_max = 55.0
+lon_min = 14.0
+lon_max = 24.0
+
+# Inne przykładowe regiony:
+# Europa Środkowa: lat_min=45, lat_max=55, lon_min=10, lon_max=25
+# Cała Polska: lat_min=49, lat_max=54.9, lon_min=14.1, lon_max=24.2
+

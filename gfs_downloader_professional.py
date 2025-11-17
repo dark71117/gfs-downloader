@@ -735,12 +735,14 @@ class ForecastDownloader:
             os.makedirs('temp')
         
         temp_file = os.path.join('temp', f'gfs_{self.run_date}_{self.run_hour}_f{forecast_hour:03d}.grib2')
+        file_size_bytes = 0
         
         try:
             with open(temp_file, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
+                        file_size_bytes += len(chunk)
             
             # Parsuj GRIB2
             all_datasets = []
@@ -809,7 +811,7 @@ class ForecastDownloader:
             # Konwertuj do DataFrame
             if len(all_datasets) == 0:
                 module_logger.warning(f"thr: {thread_id} - Brak datasetów po parsowaniu f{forecast_hour:03d}")
-                return (False, forecast_info, None)
+                return (False, forecast_info, None, 0)
             
             module_logger.info(f"thr: {thread_id} - Konwertuję {len(all_datasets)} datasetów do DataFrame dla f{forecast_hour:03d}")
             df = None
@@ -884,7 +886,7 @@ class ForecastDownloader:
             
             # Przygotuj DataFrame
             if df is None or len(df) == 0:
-                return (False, forecast_info, None)
+                return (False, forecast_info, None, 0)
             
             df['run_time'] = run_time
             df['created_at'] = datetime.utcnow()
@@ -905,6 +907,14 @@ class ForecastDownloader:
             if 'u10' in df.columns and 'v10' in df.columns:
                 df['wind_speed'] = np.sqrt(df['u10']**2 + df['v10']**2)
                 df['wind_dir'] = (270 - np.arctan2(df['v10'], df['u10']) * 180 / np.pi) % 360
+            
+            # Zaokrąglij wszystkie kolumny numeryczne do 2 miejsc po przecinku
+            # (oprócz id - jeśli istnieje)
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                if col not in ['id']:  # Nie zaokrąglaj ID jeśli istnieje
+                    # Zaokrąglij do 2 miejsc po przecinku (zmniejsza rozmiar bazy)
+                    df[col] = df[col].round(2)
             
             # ZAPIS DO CSV (backup przed zapisem do MySQL)
             csv_dir = os.path.join('temp', 'csv_backup')
@@ -930,17 +940,18 @@ class ForecastDownloader:
                     chunksize=1000,
                     method='multi'
                 )
-                module_logger.info(f"thr: {thread_id} - Zakończono zapis do bazy dla f{forecast_hour:03d} ({len(df)} rekordów)")
+                file_size_mb = file_size_bytes / (1024 * 1024)
+                module_logger.info(f"thr: {thread_id} - Zakończono zapis do bazy dla f{forecast_hour:03d} ({len(df)} rekordów, {file_size_mb:.2f} MB)")
             except Exception as e:
                 # Możliwe duplikaty - sprawdź przed zapisem
                 module_logger.warning(f"thr: {thread_id} - Błąd zapisu do bazy dla f{forecast_hour:03d}: {e}")
-                return (False, forecast_info, None)
+                return (False, forecast_info, None, 0)
             
-            return (True, forecast_info, df)
+            return (True, forecast_info, df, file_size_bytes)
             
         except Exception as e:
             module_logger.error(f"Błąd pobierania/przetwarzania f{forecast_hour:03d}: {e}", exc_info=True)
-            return (False, forecast_info, None)
+            return (False, forecast_info, None, 0)
         
         finally:
             # Usuń plik tymczasowy
@@ -978,10 +989,11 @@ def worker_thread(queue, downloader, progress_queue, stats, thread_id=None):
             success = False
             info = forecast_info
             df = None
+            file_size_bytes = 0
             
             while attempt_count < 3:  # Maksymalnie 3 próby
                 try:
-                    success, info, df = downloader.download_and_process(forecast_info, progress_queue, thread_id, attempt_count)
+                    success, info, df, file_size_bytes = downloader.download_and_process(forecast_info, progress_queue, thread_id, attempt_count)
                     if success:
                         break
                 except Exception as e:
@@ -995,6 +1007,9 @@ def worker_thread(queue, downloader, progress_queue, stats, thread_id=None):
             if success:
                 stats['success'] += 1
                 stats['total_records'] += len(df) if df is not None else 0
+                if 'total_bytes' not in stats:
+                    stats['total_bytes'] = 0
+                stats['total_bytes'] += file_size_bytes
             else:
                 stats['failed'] += 1
                 module_logger.error(f"thr: {thread_id} - Nie udało się pobrać f{forecast_hour:03d} po {attempt_count} próbach")
@@ -1005,6 +1020,7 @@ def worker_thread(queue, downloader, progress_queue, stats, thread_id=None):
                 'forecast_hour': info['forecast_hour'],
                 'success': success,
                 'total_records': len(df) if df is not None else 0,
+                'file_size_bytes': file_size_bytes,
                 'thread_id': thread_id
             })
             

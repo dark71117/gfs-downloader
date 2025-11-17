@@ -1,0 +1,57 @@
+================================================================================
+  GFS WEATHER DATA DOWNLOADER - INSTRUKCJA INSTALACJI
+================================================================================
+
+📖 PRZECZYTAJ NAJPIERW: INSTALACJA_PELNA.md
+
+To jest najważniejszy plik z instrukcją instalacji. Zawiera wszystkie kroki
+potrzebne do poprawnej instalacji programu na nowym komputerze.
+
+================================================================================
+  NAJSZYBSZA INSTALACJA (PowerShell)
+================================================================================
+
+1. Sklonuj repozytorium:
+   git clone https://github.com/twoj-username/gfs-downloader.git
+   cd gfs-downloader
+
+2. Utwórz środowisko conda:
+   conda create -n gfs314 python=3.14.0 -y
+
+3. ZAINSTALUJ ECCODES I CFGRIB (WAŻNE - bez tego nie będzie działać!):
+   conda install -n gfs314 -c conda-forge eccodes cfgrib -y
+
+4. Zainstaluj pozostałe biblioteki:
+   conda run -n gfs314 pip install -r requirements.txt
+
+5. Utwórz config.ini:
+   if (!(Test-Path "config.ini")) { Copy-Item "config.ini.example" "config.ini" }
+
+6. Skonfiguruj bazę danych MySQL (patrz INSTALACJA_PELNA.md)
+
+7. Uruchom program:
+   conda activate gfs314
+   python gfs_downloader_daemon.py
+
+================================================================================
+  WAŻNE INFORMACJE
+================================================================================
+
+✅ Python 3.14.0 - wymagana wersja
+✅ eccodes i cfgrib MUSZĄ być przez conda-forge
+✅ Baza danych MySQL musi być uruchomiona
+✅ Plik config.ini musi być skonfigurowany
+
+================================================================================
+  PLIKI Z INSTRUKCJAMI
+================================================================================
+
+📖 INSTALACJA_PELNA.md     - Kompletna instrukcja krok po kroku
+📖 SYNCHRONIZACJA.md        - Jak synchronizować między komputerami
+📖 INSTRUKCJA.md            - Instrukcja użytkowania (stara)
+📖 SZYBKA_POMOC.md          - Rozwiązywanie problemów
+
+================================================================================
+
+Jeśli masz problemy - sprawdź INSTALACJA_PELNA.md sekcję "Rozwiązywanie problemów"
+

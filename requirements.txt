@@ -1,19 +1,23 @@
 # Wymagane biblioteki Python dla GFS Downloader
+# Kompatybilne z Python 3.11 (zalecane) i Python 3.12
+# 
+# Uwaga: Używamy >= zamiast == dla łatwiejszej synchronizacji między komputerami
+# Jeśli potrzebujesz dokładnych wersji, użyj environment.yml (conda)
 
 # Podstawowe biblioteki
-xarray==2024.1.0
-pandas==2.2.0
-requests==2.31.0
+xarray>=2024.1.0
+pandas>=2.2.0
+requests>=2.31.0
 
 # Baza danych
-sqlalchemy==2.0.25
-pymysql==1.1.0
+sqlalchemy>=2.0.25
+pymysql>=1.1.0
 
 # Obsługa plików GRIB2
-cfgrib==0.9.10.4
-eccodes==1.6.1
+cfgrib>=0.9.10.4
+eccodes>=1.6.1
 
 # Dodatkowe zależności
-numpy==1.26.4  # Użyj 1.x zamiast 2.x dla lepszej kompatybilności z Python 3.9
-netcdf4==1.6.5
-tqdm==4.66.1  # Progress bar dla PROFESSIONAL VERSION
+numpy>=1.26.4,<2.0.0  # Użyj 1.x zamiast 2.x dla lepszej kompatybilności z Python 3.11
+netcdf4>=1.6.5
+tqdm>=4.66.1  # Progress bar dla PROFESSIONAL VERSION

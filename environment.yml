@@ -1,0 +1,22 @@
+# Plik środowiska conda dla GFS Downloader
+# Użycie: conda env create -f environment.yml
+# Następnie: conda activate gfs314
+
+name: gfs314
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.14.0
+  - eccodes  # WAŻNE: przez conda-forge (zawiera biblioteki systemowe)
+  - cfgrib  # WAŻNE: przez conda-forge (lepsza kompatybilność z eccodes)
+  - pip
+  - pip:
+    - xarray>=2024.1.0
+    - pandas>=2.2.0
+    - requests>=2.31.0
+    - sqlalchemy>=2.0.25
+    - pymysql>=1.1.0
+    - netcdf4>=1.6.5
+    - tqdm>=4.66.1
+

@@ -17,13 +17,28 @@ Automatic downloader for GFS (Global Forecast System) weather data with MySQL da
 
 ## Quick Start
 
-1. Install Python 3.9+
-2. Install XAMPP (MySQL)
-3. Extract files
-4. Run: `pip install -r requirements.txt`
-5. Import `setup_database.sql` to MySQL
-6. Configure `config.ini`
-7. Run: `python gfs_downloader.py` or `uruchom.bat`
+**📖 ZOBACZ: `INSTALACJA_PELNA.md` - Kompletna instrukcja instalacji!**
+
+### Szybka instalacja (Windows):
+
+```powershell
+# 1. Utwórz środowisko conda z Python 3.14.0
+conda create -n gfs314 python=3.14.0 -y
+
+# 2. Zainstaluj eccodes i cfgrib przez conda-forge (WAŻNE!)
+conda install -n gfs314 -c conda-forge eccodes cfgrib -y
+
+# 3. Zainstaluj pozostałe biblioteki
+conda run -n gfs314 pip install -r requirements.txt
+
+# 4. Skonfiguruj bazę danych i config.ini (patrz INSTALACJA_PELNA.md)
+
+# 5. Uruchom
+conda activate gfs314
+python gfs_downloader_daemon.py
+```
+
+**⚠️ WAŻNE:** Zobacz `INSTALACJA_PELNA.md` dla szczegółowej instrukcji krok po kroku!
 
 ## Files
 
