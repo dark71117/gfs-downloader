@@ -480,13 +480,37 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
                         # Dla poziomów izobarycznych dodaj _XXX_mb
                         level_val = var_data.coords['isobaricInhPa'].values
                         if isinstance(level_val, np.ndarray) and level_val.size > 0:
-                            level_val = level_val.item() if level_val.size == 1 else level_val[0]
+                            if level_val.size == 1:
+                                level_val = level_val.item()
+                            else:
+                                # Jeśli jest wiele poziomów, weź pierwszy
+                                level_val = level_val[0]
+                        
+                        # Walidacja poziomu (999 mb nie istnieje - to błąd w danych)
+                        level_val = float(level_val)
+                        # Prawidłowe poziomy izobaryczne GFS: 1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 70, 50, 30, 20, 10
+                        valid_isobaric_levels = [10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 925, 950, 975, 1000]
+                        if level_val < 10 or level_val > 1100 or level_val not in valid_isobaric_levels:
+                            print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam nieprawidłowy poziom: {level_val} mb dla {var_name}", flush=True)
+                            continue
+                        
                         full_var_name = f"{var_name}_{int(level_val)}_mb"
                     elif 'heightAboveGround' in var_data.dims:
                         # Dla wysokości nad ziemią dodaj _XXm
                         height_val = var_data.coords['heightAboveGround'].values
                         if isinstance(height_val, np.ndarray) and height_val.size > 0:
-                            height_val = height_val.item() if height_val.size == 1 else height_val[0]
+                            if height_val.size == 1:
+                                height_val = height_val.item()
+                            else:
+                                height_val = height_val[0]
+                        
+                        # Walidacja wysokości (prawidłowe: 2, 10, 80, 100, etc.)
+                        height_val = float(height_val)
+                        # Prawidłowe wysokości nad ziemią: 2, 10, 80, 100, etc. (nie 0, nie 999, nie ujemne)
+                        if height_val <= 0 or height_val > 1000 or height_val == 999:
+                            print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam nieprawidłową wysokość: {height_val} m dla {var_name}", flush=True)
+                            continue
+                        
                         full_var_name = f"{var_name}_{int(height_val)}m"
                     else:
                         # Dla pozostałych (surface, meanSea, etc.) bez sufiksu
@@ -561,6 +585,20 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
             df['forecast_time'] = forecast_time
             df.rename(columns={'latitude': 'lat', 'longitude': 'lon'}, inplace=True)
             
+            # Usuń kolumny które nie powinny być w bazie (np. isobaricInhPa, heightAboveGround jako kolumny)
+            cols_to_drop = [c for c in df.columns if c in ['isobaricInhPa', 'heightAboveGround', 'time', 'valid_time']]
+            if cols_to_drop:
+                df = df.drop(columns=cols_to_drop)
+            
+            # Usuń kolumny z nieprawidłowymi poziomami (np. m999, m0, 999, etc.)
+            invalid_patterns = ['_m999', '_m0_', '_999_', '_999m', '_999mb', 'm999', 'm0', '_0m', '_0_mb']
+            invalid_cols = [c for c in df.columns if any(pattern in c.lower() for pattern in invalid_patterns)]
+            # Dodatkowo usuń kolumny z poziomem 999 (nieprawidłowy poziom)
+            invalid_cols.extend([c for c in df.columns if '_999' in c.lower() and c not in invalid_cols])
+            if invalid_cols:
+                print(f"{get_timestamp()} - [{fh_str}] ⚠ Usuwam nieprawidłowe kolumny: {invalid_cols}", flush=True)
+                df = df.drop(columns=invalid_cols)
+            
             # Zaokrąglij wartości numeryczne do 2 miejsc po przecinku
             numeric_cols = df.select_dtypes(include=[np.number]).columns
             for col in numeric_cols:
@@ -593,14 +631,49 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
             print(f"{get_timestamp()} - [{fh_str}] Zapisuję {len(records)} rekordów do bazy...", flush=True)
             try:
                 df_final = pd.DataFrame(records)
+                
+                # Ostateczna walidacja kolumn przed zapisem - usuń wszystkie nieprawidłowe
+                invalid_patterns = ['_m999', '_m0_', '_999_', '_999m', '_999mb', 'm999', 'm0', '_0m', '_0_mb']
+                invalid_cols = [c for c in df_final.columns if any(pattern in str(c).lower() for pattern in invalid_patterns)]
+                invalid_cols.extend([c for c in df_final.columns if '_999' in str(c).lower() and c not in invalid_cols])
+                if invalid_cols:
+                    print(f"{get_timestamp()} - [{fh_str}] ⚠ Ostateczne usuwanie nieprawidłowych kolumn przed zapisem: {invalid_cols}", flush=True)
+                    df_final = df_final.drop(columns=invalid_cols)
+                
+                # Usuń również kolumny techniczne jeśli jeszcze są
+                tech_cols = [c for c in df_final.columns if c in ['isobaricInhPa', 'heightAboveGround', 'time', 'valid_time']]
+                if tech_cols:
+                    df_final = df_final.drop(columns=tech_cols)
+                
                 df_final.to_sql('gfs_forecast', engine, if_exists='append', index=False, method='multi', chunksize=1000)
                 print(f"{get_timestamp()} - [{fh_str}] ✓ Zapisano {len(records)} rekordów", flush=True)
                 del df_final
                 import gc
                 gc.collect()
                 return len(records)
+            except KeyError as e:
+                print(f"{get_timestamp()} - [{fh_str}] ✗ BŁĄD KOLUMNY: {e}", flush=True)
+                import traceback
+                print(f"{get_timestamp()} - [{fh_str}] Traceback:\n{traceback.format_exc()}", flush=True)
+                # Spróbuj ponownie z filtrowaniem kolumn
+                try:
+                    df_final = pd.DataFrame(records)
+                    # Usuń wszystkie kolumny które mogą powodować problemy
+                    all_invalid = [c for c in df_final.columns if any(x in str(c).lower() for x in ['_m999', '_999', 'm999', '_m0', 'm0'])]
+                    if all_invalid:
+                        df_final = df_final.drop(columns=all_invalid)
+                    df_final.to_sql('gfs_forecast', engine, if_exists='append', index=False, method='multi', chunksize=1000)
+                    print(f"{get_timestamp()} - [{fh_str}] ✓ Zapisano po naprawie kolumn: {len(df_final)} rekordów", flush=True)
+                    return len(df_final)
+                except:
+                    return 0
             except MemoryError as e:
                 print(f"{get_timestamp()} - [{fh_str}] ✗ BŁĄD PAMIĘCI przy zapisie: {e}", flush=True)
+                return 0
+            except Exception as e:
+                print(f"{get_timestamp()} - [{fh_str}] ✗ BŁĄD przy zapisie: {e}", flush=True)
+                import traceback
+                print(f"{get_timestamp()} - [{fh_str}] Traceback:\n{traceback.format_exc()}", flush=True)
                 return 0
         else:
             print(f"{get_timestamp()} - [{fh_str}] ✗ Brak rekordów do zapisania", flush=True)
