@@ -20,6 +20,7 @@ from tqdm import tqdm
 import warnings
 import os
 import logging
+from collections import deque
 warnings.filterwarnings('ignore')
 
 # Stłum błędy ECCODES (są tylko ostrzeżeniami)
@@ -36,6 +37,44 @@ logging.getLogger('requests').setLevel(logging.WARNING)
 
 # Logger dla modułu (będzie używał root logger jeśli nie jest skonfigurowany)
 module_logger = logging.getLogger(__name__)
+
+# === RATE LIMITING - 120 zapytań/minutę (1 zapytanie co 0.5 sekundy) ===
+# Globalny licznik zapytań z timestampami (thread-safe)
+_rate_limit_lock = threading.Lock()
+_rate_limit_timestamps = deque(maxlen=120)  # Przechowuje ostatnie 120 timestampów
+
+def wait_for_rate_limit():
+    """
+    Czeka jeśli potrzeba, żeby nie przekroczyć limitu 120 zapytań/minutę.
+    Thread-safe.
+    """
+    global _rate_limit_timestamps
+    
+    with _rate_limit_lock:
+        now = time.time()
+        
+        # Usuń stare timestampy (starsze niż 60 sekund)
+        while _rate_limit_timestamps and (now - _rate_limit_timestamps[0]) > 60:
+            _rate_limit_timestamps.popleft()
+        
+        # Jeśli mamy już 120 zapytań w ostatniej minucie, poczekaj
+        if len(_rate_limit_timestamps) >= 120:
+            # Oblicz ile sekund trzeba poczekać
+            oldest_timestamp = _rate_limit_timestamps[0]
+            wait_time = 60 - (now - oldest_timestamp) + 0.1  # +0.1 dla bezpieczeństwa
+            if wait_time > 0:
+                module_logger.debug(f"Rate limit: czekam {wait_time:.2f}s (120 zapytań/min)")
+                time.sleep(wait_time)
+                # Usuń stare timestampy ponownie po czekaniu
+                now = time.time()
+                while _rate_limit_timestamps and (now - _rate_limit_timestamps[0]) > 60:
+                    _rate_limit_timestamps.popleft()
+        
+        # Dodaj aktualny timestamp
+        _rate_limit_timestamps.append(time.time())
+        
+        # Minimalne opóźnienie między zapytaniami (0.5s = 120/min)
+        time.sleep(0.5)
 
 # === GŁÓWNY KOD - WYKONUJE SIĘ TYLKO GDY URUCHOMIONY BEZPOŚREDNIO ===
 # Sprawdź czy moduł jest uruchamiany bezpośrednio (nie importowany)
@@ -115,8 +154,20 @@ def check_gfs_availability(date_str, hour_str, forecast_hour, verbose=False):
         url = f"https://{server}{base_path}"
         
         try:
+            # Rate limiting przed sprawdzeniem
+            wait_for_rate_limit()
+            
             # Używamy HEAD zamiast GET dla szybszego sprawdzenia
             response = requests.head(url, timeout=10, allow_redirects=True)
+            
+            # Obsługa HTTP 429
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                if verbose:
+                    module_logger.debug(f"  ⚠️ HTTP 429 z {server} - czekam {retry_after}s")
+                time.sleep(retry_after)
+                wait_for_rate_limit()
+                response = requests.head(url, timeout=10, allow_redirects=True)
             
             if response.status_code == 200:
                 content_type = response.headers.get('content-type', '').lower()
@@ -147,7 +198,19 @@ def check_gfs_availability(date_str, hour_str, forecast_hour, verbose=False):
         url = f"https://{server}{base_path}"
         
         try:
+            wait_for_rate_limit()
             response = requests.get(url, stream=True, timeout=10)
+            
+            # Obsługa HTTP 429
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                if verbose:
+                    module_logger.debug(f"  ⚠️ HTTP 429 z {server} (GET) - czekam {retry_after}s")
+                response.close()
+                time.sleep(retry_after)
+                wait_for_rate_limit()
+                response = requests.get(url, stream=True, timeout=10)
+            
             response.close()
             
             if response.status_code == 200:
@@ -674,7 +737,19 @@ class ForecastDownloader:
         for server in servers:
             idx_url = f"https://{server}{idx_path}"
             try:
+                # Rate limiting przed sprawdzeniem .idx
+                wait_for_rate_limit()
                 idx_response = requests.head(idx_url, timeout=10, allow_redirects=True)
+                
+                # Obsługa HTTP 429
+                if idx_response.status_code == 429:
+                    retry_after = int(idx_response.headers.get('Retry-After', 60))
+                    module_logger.warning(f"thr: {thread_id} - HTTP 429 (Too Many Requests) dla .idx - czekam {retry_after}s")
+                    time.sleep(retry_after)
+                    # Spróbuj ponownie
+                    wait_for_rate_limit()
+                    idx_response = requests.head(idx_url, timeout=10, allow_redirects=True)
+                
                 if idx_response.status_code == 200:
                     idx_available = True
                     module_logger.debug(f"thr: {thread_id} - Plik .idx dostępny na {server} dla f{forecast_hour:03d}")
@@ -691,10 +766,30 @@ class ForecastDownloader:
             
             try:
                 module_logger.info(f"thr: {thread_id} - Pobieranie (licznikProbPobrania = {attempt_count}): f{forecast_hour:03d}")
+                
+                # Rate limiting przed pobraniem
+                wait_for_rate_limit()
+                
                 # Pobierz plik
                 response = requests.get(url, stream=True, timeout=300)
                 status_code = response.status_code
                 module_logger.info(f"thr: {thread_id} - Status pobrania pliku: {status_code}")
+                
+                # Obsługa HTTP 429 (Too Many Requests)
+                if status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    module_logger.warning(f"thr: {thread_id} - ⚠️ HTTP 429 (Too Many Requests) z {server} - czekam {retry_after}s")
+                    response.close()
+                    response = None
+                    
+                    # Czekaj zgodnie z Retry-After
+                    time.sleep(retry_after)
+                    
+                    # Spróbuj ponownie (z rate limiting)
+                    wait_for_rate_limit()
+                    response = requests.get(url, stream=True, timeout=300)
+                    status_code = response.status_code
+                    module_logger.info(f"thr: {thread_id} - Status po retry: {status_code}")
                 
                 if status_code == 200:
                     used_server = server
@@ -702,12 +797,21 @@ class ForecastDownloader:
                     break
                 elif status_code == 404:
                     module_logger.warning(f"thr: {thread_id} - Plik f{forecast_hour:03d} niedostępny na {server} (404)")
-                    response.close()
+                    if response:
+                        response.close()
+                    response = None
+                    continue
+                elif status_code == 429:
+                    # Jeśli nadal 429 po retry, spróbuj następny serwer
+                    module_logger.warning(f"thr: {thread_id} - Nadal HTTP 429 z {server} - próbuję następny serwer")
+                    if response:
+                        response.close()
                     response = None
                     continue
                 else:
                     module_logger.warning(f"thr: {thread_id} - Nieoczekiwany status {status_code} z {server}")
-                    response.close()
+                    if response:
+                        response.close()
                     response = None
                     continue
             except requests.exceptions.Timeout:
