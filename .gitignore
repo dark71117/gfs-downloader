@@ -45,3 +45,8 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
+temp_grib_filtered/ 
+*.grb2 
+*.grib 
+__pycache__/ 
+*.pyc 
