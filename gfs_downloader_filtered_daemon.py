@@ -7,9 +7,16 @@ import sys
 import os
 import time
 import configparser
+import threading
+import queue
+import glob
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 import logging
+try:
+    import pytz
+except ImportError:
+    pytz = None
 
 # Import funkcji z filtered version
 from gfs_downloader_filtered_fixed import (
@@ -57,10 +64,157 @@ error_logger.addHandler(error_handler)
 error_logger.propagate = False
 
 # === KONFIGURACJA ===
-CHECK_INTERVAL = 1800  # 30 minut między sprawdzaniami nowych runów
 RETRY_FAILED_INTERVAL = 120  # 2 minuty między ponawianiem błędnych pobrań
-INTELLIGENT_CHECK_START_OFFSET = 3  # Sprawdzaj od +3h od czasu run (00->03, 06->09, 12->15, 18->21)
-INTELLIGENT_CHECK_INTERVAL = 600  # 10 minut między sprawdzaniami podczas oczekiwania na nowy run
+
+def load_config():
+    """Wczytuje konfigurację z config.ini"""
+    try:
+        config = configparser.ConfigParser()
+        config.read("config.ini", encoding='utf-8')
+        
+        result = {
+            'mysql_user': config["database"]["user"],
+            'mysql_password': config["database"]["password"],
+            'mysql_host': config["database"]["host"],
+            'mysql_database': config["database"]["database"],
+            'lat_min': float(config["region"]["lat_min"]),
+            'lat_max': float(config["region"]["lat_max"]),
+            'lon_min': float(config["region"]["lon_min"]),
+            'lon_max': float(config["region"]["lon_max"]),
+            'num_threads': int(config.get("threading", "num_threads", fallback=6)),
+        }
+        
+        # Wczytaj harmonogram
+        schedule = {}
+        if 'schedule' in config:
+            for run_hour in ['00', '06', '12', '18']:
+                if run_hour in config['schedule']:
+                    check_time_str = config['schedule'][run_hour]
+                    # Parsuj czas (format: "HH:MM")
+                    try:
+                        hour, minute = map(int, check_time_str.split(':'))
+                        schedule[int(run_hour)] = (hour, minute)
+                    except:
+                        logger.warning(f"Nieprawidłowy format czasu w harmonogramie dla run {run_hour}: {check_time_str}")
+        
+        # Domyślny harmonogram jeśli nie ma w config.ini
+        if not schedule:
+            schedule = {
+                0: (3, 0),   # Run 00:00 -> sprawdzaj od 03:00
+                6: (9, 0),   # Run 06:00 -> sprawdzaj od 09:00
+                12: (15, 0), # Run 12:00 -> sprawdzaj od 15:00
+                18: (21, 0), # Run 18:00 -> sprawdzaj od 21:00
+            }
+        
+        result['schedule'] = schedule
+        result['check_interval_before'] = int(config.get("schedule", "check_interval_before", fallback=600))  # 10 min
+        result['check_interval_after'] = int(config.get("schedule", "check_interval_after", fallback=60))    # 1 min
+        
+        # Wczytaj konfigurację CSV backup
+        result['csv_backup_dir'] = config.get("csv_backup", "csv_backup_dir", fallback="temp/csv_backup")
+        result['csv_keep_runs'] = int(config.get("csv_backup", "csv_keep_runs", fallback=8))  # 2 dni = 8 runów
+        
+        return result
+    except Exception as e:
+        logger.error(f"Błąd wczytywania konfiguracji: {e}")
+        sys.exit(1)
+
+def get_local_time_str(utc_time):
+    """
+    Konwertuje czas UTC na czas lokalny (Polska - automatycznie obsługuje czas letni/zimowy).
+    Zwraca string z czasem lokalnym.
+    """
+    try:
+        if pytz:
+            # Strefa czasowa Polski (automatycznie obsługuje czas letni/zimowy)
+            poland_tz = pytz.timezone('Europe/Warsaw')
+            local_time = utc_time.replace(tzinfo=pytz.UTC).astimezone(poland_tz)
+            return local_time.strftime('%Y-%m-%d %H:%M:%S')
+    except:
+        pass
+    # Fallback jeśli pytz nie jest dostępne
+    return utc_time.strftime('%Y-%m-%d %H:%M:%S')
+
+def clean_old_csv_files(csv_backup_dir, keep_runs=8):
+    """
+    Czyści stare pliki CSV, zostawiając tylko ostatnie N runów (domyślnie 8 = 2 dni).
+    """
+    try:
+        if not os.path.exists(csv_backup_dir):
+            return
+        
+        # Znajdź wszystkie pliki CSV
+        csv_files = glob.glob(os.path.join(csv_backup_dir, 'gfs_*.csv'))
+        
+        if len(csv_files) <= keep_runs * 209:  # 209 prognoz na run
+            return  # Nie ma co czyścić
+        
+        # Wyciągnij unikalne runy z nazw plików (format: gfs_YYYYMMDD_HH_fXXX.csv)
+        runs = {}
+        for csv_file in csv_files:
+            basename = os.path.basename(csv_file)
+            # Format: gfs_YYYYMMDD_HH_fXXX.csv
+            parts = basename.replace('gfs_', '').replace('.csv', '').split('_')
+            if len(parts) >= 3:
+                date_str = parts[0]  # YYYYMMDD
+                hour_str = parts[1]   # HH
+                run_key = f"{date_str}_{hour_str}"
+                if run_key not in runs:
+                    runs[run_key] = []
+                runs[run_key].append(csv_file)
+        
+        # Posortuj runy po dacie (najnowsze pierwsze)
+        sorted_runs = sorted(runs.items(), key=lambda x: x[0], reverse=True)
+        
+        # Zostaw tylko ostatnie N runów
+        runs_to_keep = sorted_runs[:keep_runs]
+        files_to_keep = set()
+        for run_key, files in runs_to_keep:
+            files_to_keep.update(files)
+        
+        # Usuń pliki które nie są w liście do zachowania
+        deleted_count = 0
+        for csv_file in csv_files:
+            if csv_file not in files_to_keep:
+                try:
+                    os.remove(csv_file)
+                    deleted_count += 1
+                except:
+                    pass
+        
+        if deleted_count > 0:
+            logger.info(f"Usunięto {deleted_count} starych plików CSV (zachowano {len(files_to_keep)} plików z {keep_runs} ostatnich runów)")
+    except Exception as e:
+        logger.warning(f"Błąd czyszczenia starych plików CSV: {e}")
+
+def should_check_now(now_utc, schedule):
+    """
+    Sprawdza czy teraz jest czas na sprawdzanie (czy minął czas z harmonogramu).
+    Sprawdza TYLKO najnowszy run który powinien być dostępny (nie wszystkie runy wstecz).
+    Zwraca (should_check, next_run_hour, next_run_date) lub (False, None, None).
+    """
+    # Znajdź najnowszy run który powinien być już dostępny (sprawdź od najnowszego)
+    # Sprawdź runy dla dzisiaj i wczoraj (max 24h wstecz)
+    for day_offset in [0, -1]:  # Dzisiaj i wczoraj
+        check_date = (now_utc + timedelta(days=day_offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Sprawdź runy od najnowszego do najstarszego (18, 12, 6, 0)
+        for run_hour in [18, 12, 6, 0]:
+            if run_hour not in schedule:
+                continue
+            
+            run_time = check_date.replace(hour=run_hour)
+            check_hour, check_minute = schedule[run_hour]
+            check_time = check_date.replace(hour=check_hour, minute=check_minute)
+            
+            # Jeśli minął czas sprawdzania dla tego runu
+            if now_utc >= check_time:
+                # Sprawdź czy to nie jest zbyt stary run (max 24h wstecz od czasu sprawdzania)
+                if (now_utc - check_time).total_seconds() <= 24 * 3600:
+                    # To jest najnowszy run który powinien być dostępny - zwróć go
+                    return True, run_hour, run_time
+    
+    return False, None, None
 
 def find_next_gfs_run_intelligent(engine):
     """
@@ -80,7 +234,7 @@ def find_next_gfs_run_intelligent(engine):
         next_run_date = now_utc.replace(hour=next_run_hour, minute=0, second=0, microsecond=0)
     
     # Sprawdź czy już minął czas rozpoczęcia sprawdzania (+3h od run)
-    check_start_time = next_run_date + timedelta(hours=INTELLIGENT_CHECK_START_OFFSET)
+    check_start_time = next_run_date + timedelta(hours=3)
     
     if now_utc < check_start_time:
         # Jeszcze za wcześnie - zwróć None
@@ -99,6 +253,7 @@ def find_next_gfs_run_intelligent(engine):
 def find_latest_gfs_run_with_retry(engine):
     """
     Znajduje najnowszy dostępny run GFS, sprawdzając również czy nie ma nowszych.
+    WAŻNE: Sprawdza dostępność pierwszej BRAKUJĄCEJ prognozy, nie tylko f000!
     """
     now_utc = datetime.utcnow()
     
@@ -130,41 +285,61 @@ def find_latest_gfs_run_with_retry(engine):
         if check_time.hour not in [0, 6, 12, 18]:
             continue
         
+        # Pomiń runy starsze niż 48h - prawdopodobnie już nie są dostępne na serwerze
+        age_hours = (now_utc - check_time).total_seconds() / 3600
+        if age_hours > 48:
+            logger.debug(f"Run {check_time.strftime('%Y-%m-%d %H:00')} UTC jest za stary ({age_hours:.1f}h) - pomijam")
+            continue
+        
         date_str = check_time.strftime("%Y%m%d")
         hour_str = f"{check_time.hour:02d}"
         
-        if last_run_in_db and check_time <= last_run_in_db:
-            # Sprawdź czy ten run ma wszystkie prognozy
-            try:
-                existing_hours = get_existing_forecast_hours(check_time, engine)
-                required_hours = get_required_forecast_hours()
-                missing_hours = required_hours - existing_hours
+        # ZAWSZE sprawdź które prognozy są już w bazie dla tego runu
+        try:
+            existing_hours = get_existing_forecast_hours(check_time, engine)
+            required_hours = get_required_forecast_hours()
+            missing_hours = sorted(list(required_hours - existing_hours))
+            
+            if len(missing_hours) == 0:
+                # Wszystkie prognozy są już pobrane - pomiń ten run
+                logger.debug(f"Run {check_time.strftime('%Y-%m-%d %H:00')} UTC - wszystkie prognozy już pobrane, pomijam")
+                continue
+            
+            # Ten run ma brakujące prognozy - sprawdź czy są jeszcze dostępne na serwerze
+            # Sprawdź dostępność pierwszej BRAKUJĄCEJ prognozy (nie f000!)
+            first_missing_hour = missing_hours[0]
+            logger.info(f"Run {check_time.strftime('%Y-%m-%d %H:00')} UTC - brakuje {len(missing_hours)} prognoz (pierwsza brakująca: f{first_missing_hour:03d})")
+            
+            if check_gfs_availability(date_str, hour_str, first_missing_hour, verbose=False):
+                # Brakujące prognozy są dostępne - możemy kontynuować pobieranie
+                logger.info(f"✓ Run {check_time.strftime('%Y-%m-%d %H:00')} UTC - brakujące prognozy są dostępne na serwerze")
+                return check_time, date_str, hour_str
+            else:
+                # Brakujące prognozy nie są już dostępne na serwerze - pomiń ten run
+                logger.info(f"✗ Run {check_time.strftime('%Y-%m-%d %H:00')} UTC - brakujące prognozy (f{first_missing_hour:03d}) nie są już dostępne na serwerze - pomijam")
+                continue
                 
-                if len(missing_hours) > 0:
-                    # Ten run ma brakujące prognozy
-                    return check_time, date_str, hour_str
-            except:
-                pass
+        except Exception as e:
+            logger.warning(f"Błąd sprawdzania prognoz dla run {check_time.strftime('%Y-%m-%d %H:00')} UTC: {e}")
+            # W przypadku błędu, sprawdź dostępność f000 jako fallback
+            if check_gfs_availability(date_str, hour_str, 0, verbose=False):
+                return check_time, date_str, hour_str
             continue
-        
-        # Sprawdź czy run jest dostępny
-        if check_gfs_availability(date_str, hour_str, 0, verbose=False):
-            return check_time, date_str, hour_str
     
     return None, None, None
 
-def download_forecast_with_retry(forecast_hour, RUN_DATE, RUN_HOUR, run_time, lat_min, lat_max, lon_min, lon_max, engine, temp_dir, max_retries=10):
+def download_forecast_with_retry(forecast_hour, RUN_DATE, RUN_HOUR, run_time, lat_min, lat_max, lon_min, lon_max, engine, temp_dir, params_config=None, cfgrib_to_config=None, csv_backup_dir=None, max_retries=10):
     """
     Pobiera jedną prognozę z automatycznym ponawianiem do skutku.
     Zwraca (success, records, file_size_bytes).
     """
-    url = build_grib_filter_url(RUN_DATE, RUN_HOUR, forecast_hour)
+    url = build_grib_filter_url(RUN_DATE, RUN_HOUR, forecast_hour, params_config=params_config)
     temp_file = os.path.join(temp_dir, f"gfs_f{forecast_hour:03d}_filtered.grb2")
     
     for attempt in range(max_retries):
         try:
-            # Pobierz plik
-            success, file_size = download_grib_filtered(url, temp_file, forecast_hour=forecast_hour)
+            # Pobierz plik (przekaż date_str i hour_str dla fallback)
+            success, file_size = download_grib_filtered(url, temp_file, forecast_hour=forecast_hour, hour_str=RUN_HOUR, resolution='0p25', params_config=params_config)
             
             if not success:
                 if attempt < max_retries - 1:
@@ -176,7 +351,8 @@ def download_forecast_with_retry(forecast_hour, RUN_DATE, RUN_HOUR, run_time, la
             # Przetwórz i zapisz
             num_records = process_grib_to_db_filtered(
                 temp_file, run_time, forecast_hour,
-                lat_min, lat_max, lon_min, lon_max, engine
+                lat_min, lat_max, lon_min, lon_max, engine,
+                params_config, cfgrib_to_config, csv_backup_dir
             )
             
             # Usuń plik tymczasowy
@@ -211,6 +387,10 @@ def download_all_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
     """
     logger.info(f"Rozpoczynam pobieranie prognoz dla run {run_time.strftime('%Y-%m-%d %H:00')} UTC")
     
+    # Wczytaj konfigurację parametrów
+    from gfs_downloader_filtered_fixed import load_parameters_config
+    params_config, cfgrib_to_config = load_parameters_config()
+    
     temp_dir = "temp_grib_filtered"
     os.makedirs(temp_dir, exist_ok=True)
     
@@ -229,25 +409,93 @@ def download_all_forecasts(run_time, RUN_DATE, RUN_HOUR, config, engine):
             logger.info("✓✓✓ Wszystkie 209 prognoz są już pobrane!")
             break
         
-        logger.info(f"Brakuje {len(missing_hours)} prognoz, pobieram...")
+        logger.info(f"Brakuje {len(missing_hours)} prognoz, pobieram używając {config['num_threads']} wątków...")
         
-        # Pobierz brakujące prognozy (pojedynczo, z automatycznym ponawianiem)
+        # MULTI-THREADING: Pobierz brakujące prognozy równolegle
+        import queue as queue_module
+        download_queue = queue_module.Queue()
+        progress_queue = queue_module.Queue()
+        stats = {'success': 0, 'failed': 0, 'records': 0, 'bytes': 0}
+        
+        # Dodaj prognozy do kolejki
         for forecast_hour in missing_hours:
-            success, records, file_size = download_forecast_with_retry(
-                forecast_hour, RUN_DATE, RUN_HOUR, run_time,
-                config['lat_min'], config['lat_max'],
-                config['lon_min'], config['lon_max'],
-                engine, temp_dir
-            )
-            
-            if success:
-                total_success += 1
-                total_records += records
-                total_bytes += file_size
-                logger.info(f"✓ [f{forecast_hour:03d}] Pobrano ({records} rekordów, {file_size/(1024*1024):.1f} MB)")
-            else:
-                total_failed += 1
-                logger.warning(f"✗ [f{forecast_hour:03d}] Nie udało się pobrać po wszystkich próbach")
+            download_queue.put(forecast_hour)
+        
+        # Funkcja worker thread
+        def worker_thread():
+            while True:
+                try:
+                    forecast_hour = download_queue.get(timeout=1)
+                    if forecast_hour is None:
+                        break
+                    
+                    success, records, file_size = download_forecast_with_retry(
+                        forecast_hour, RUN_DATE, RUN_HOUR, run_time,
+                        config['lat_min'], config['lat_max'],
+                        config['lon_min'], config['lon_max'],
+                        engine, temp_dir, params_config, cfgrib_to_config,
+                        config.get('csv_backup_dir', 'temp/csv_backup')
+                    )
+                    
+                    progress_queue.put({
+                        'forecast_hour': forecast_hour,
+                        'success': success,
+                        'records': records,
+                        'file_size': file_size
+                    })
+                    
+                    download_queue.task_done()
+                except queue_module.Empty:
+                    break
+                except Exception as e:
+                    logger.error(f"Błąd w worker thread: {e}", exc_info=True)
+                    progress_queue.put({
+                        'forecast_hour': forecast_hour if 'forecast_hour' in locals() else -1,
+                        'success': False,
+                        'records': 0,
+                        'file_size': 0
+                    })
+                    download_queue.task_done()
+        
+        # Uruchom wątki
+        threads = []
+        for i in range(config['num_threads']):
+            t = threading.Thread(target=worker_thread, daemon=True)
+            t.start()
+            threads.append(t)
+            logger.info(f"Wątek #{i+1} uruchomiony (ID: {t.ident})")
+        
+        # Przetwarzaj wyniki
+        completed = 0
+        while completed < len(missing_hours):
+            try:
+                progress = progress_queue.get(timeout=5)
+                completed += 1
+                
+                if progress['success']:
+                    stats['success'] += 1
+                    stats['records'] += progress['records']
+                    stats['bytes'] += progress['file_size']
+                    logger.info(f"✓ [f{progress['forecast_hour']:03d}] Pobrano ({progress['records']} rekordów, {progress['file_size']/(1024*1024):.1f} MB)")
+                else:
+                    stats['failed'] += 1
+                    logger.warning(f"✗ [f{progress['forecast_hour']:03d}] Nie udało się pobrać po wszystkich próbach")
+            except queue_module.Empty:
+                # Sprawdź czy wątki jeszcze działają
+                alive = sum(1 for t in threads if t.is_alive())
+                if alive == 0:
+                    break
+        
+        # Zakończ wątki
+        for _ in range(config['num_threads']):
+            download_queue.put(None)
+        for t in threads:
+            t.join(timeout=5)
+        
+        total_success = stats['success']
+        total_failed = stats['failed']
+        total_records = stats['records']
+        total_bytes = stats['bytes']
         
         # Jeśli były błędy, poczekaj przed ponowną próbą
         if total_failed > 0:
@@ -267,28 +515,19 @@ def main_daemon_loop():
     logger.info("=" * 70)
     
     # Wczytaj konfigurację
+    config = load_config()
+    
     try:
-        config_parser = configparser.ConfigParser()
-        config_parser.read("config.ini", encoding='utf-8')
-        
-        config = {
-            'user': config_parser["database"]["user"],
-            'password': config_parser["database"]["password"],
-            'host': config_parser["database"]["host"],
-            'database': config_parser["database"]["database"],
-            'lat_min': float(config_parser["region"]["lat_min"]),
-            'lat_max': float(config_parser["region"]["lat_max"]),
-            'lon_min': float(config_parser["region"]["lon_min"]),
-            'lon_max': float(config_parser["region"]["lon_max"]),
-        }
-        
-        MYSQL_URL = f"mysql+pymysql://{config['user']}:{config['password']}@{config['host']}/{config['database']}?charset=utf8mb4"
+        MYSQL_URL = f"mysql+pymysql://{config['mysql_user']}:{config['mysql_password']}@{config['mysql_host']}/{config['mysql_database']}?charset=utf8mb4"
         engine = create_engine(MYSQL_URL, echo=False, pool_pre_ping=True)
         
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         
-        logger.info(f"✓ Połączono z bazą: {config['database']}")
+        logger.info(f"✓ Połączono z bazą: {config['mysql_database']}")
+        logger.info(f"✓ Harmonogram sprawdzania:")
+        for run_hour, (check_hour, check_min) in sorted(config['schedule'].items()):
+            logger.info(f"   Run {run_hour:02d}:00 UTC -> sprawdzaj od {check_hour:02d}:{check_min:02d} UTC")
         
     except Exception as e:
         logger.error(f"Błąd konfiguracji: {e}")
@@ -297,29 +536,21 @@ def main_daemon_loop():
     logger.info("\n🚀 Daemon uruchomiony. Działa w tle...")
     logger.info("   (Naciśnij Ctrl+C aby zatrzymać)\n")
     
-    last_check_time = None
-    last_run_completed = None
+    schedule = config['schedule']
+    check_interval_before = config['check_interval_before']  # 10 minut
+    check_interval_after = config['check_interval_after']    # 1 minuta
     
     try:
         while True:
             current_time = datetime.utcnow()
             
-            # Sprawdź czy minął interwał sprawdzania (30 min po zakończeniu poprzedniego run)
-            should_check = False
-            if last_check_time is None:
-                should_check = True
-            elif last_run_completed:
-                # Po zakończeniu run, sprawdź po 30 minutach
-                if (current_time - last_run_completed).total_seconds() >= CHECK_INTERVAL:
-                    should_check = True
-            else:
-                # Normalne sprawdzanie co 30 minut
-                if (current_time - last_check_time).total_seconds() >= CHECK_INTERVAL:
-                    should_check = True
+            # Sprawdź czy teraz jest czas na sprawdzanie (na podstawie harmonogramu)
+            should_check, next_run_hour, next_run_date = should_check_now(current_time, schedule)
             
             if should_check:
+                local_time_str = get_local_time_str(current_time)
                 logger.info(f"\n{'='*70}")
-                logger.info(f"Sprawdzam dostępność nowych prognoz GFS... ({current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC)")
+                logger.info(f"Sprawdzam dostępność nowych prognoz GFS... ({current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC / {local_time_str} lokalny)")
                 logger.info(f"{'='*70}\n")
                 
                 # Znajdź run do pobrania (sprawdź czy są brakujące prognozy w istniejących runach)
@@ -336,37 +567,21 @@ def main_daemon_loop():
                     mb_downloaded = bytes_downloaded / (1024 * 1024)
                     logger.info(f"✓✓✓ Pobieranie zakończone: {success} sukcesów, {failed} błędów")
                     logger.info(f"📊 STATYSTYKI: Pobrano {success} plików, łącznie {mb_downloaded:.2f} MB danych, {records} rekordów w bazie")
-                    last_run_completed = current_time
-                    last_check_time = current_time
                     
-                    # Po zakończeniu run, następne sprawdzenie za 30 minut
-                    next_check = current_time + timedelta(seconds=CHECK_INTERVAL)
-                    logger.info(f"\nNastępne sprawdzenie za {CHECK_INTERVAL/60:.0f} minut ({next_check.strftime('%Y-%m-%d %H:%M:%S')} UTC)...\n")
+                    # Wyczyść stare pliki CSV
+                    clean_old_csv_files(config['csv_backup_dir'], config['csv_keep_runs'])
+                    
+                    # Po zakończeniu run, sprawdź za check_interval_after (1 min)
+                    next_check = current_time + timedelta(seconds=check_interval_after)
+                    logger.info(f"\nNastępne sprawdzenie za {check_interval_after/60:.0f} minut ({next_check.strftime('%Y-%m-%d %H:%M:%S')} UTC)...\n")
+                    time.sleep(check_interval_after)
+                    continue
                 else:
-                    # Sprawdź inteligentnie czy nie ma nowego run (sprawdza od +3h od czasu run co 10 min)
-                    next_run, next_date, next_hour = find_next_gfs_run_intelligent(engine)
-                    
-                    if next_run:
-                        logger.info(f"✓ Znaleziono nowy run: {next_run.strftime('%Y-%m-%d %H:00')} UTC")
-                        success, failed, records, bytes_downloaded = download_all_forecasts(
-                            next_run, next_date, next_hour, config, engine
-                        )
-                        mb_downloaded = bytes_downloaded / (1024 * 1024)
-                        logger.info(f"✓✓✓ Pobieranie zakończone: {success} sukcesów, {failed} błędów")
-                        logger.info(f"📊 STATYSTYKI: Pobrano {success} plików, łącznie {mb_downloaded:.2f} MB danych, {records} rekordów w bazie")
-                        last_run_completed = current_time
-                        last_check_time = current_time
-                        
-                        # Po zakończeniu run, następne sprawdzenie za 30 minut
-                        next_check = current_time + timedelta(seconds=CHECK_INTERVAL)
-                        logger.info(f"\nNastępne sprawdzenie za {CHECK_INTERVAL/60:.0f} minut ({next_check.strftime('%Y-%m-%d %H:%M:%S')} UTC)...\n")
-                    else:
-                        # Brak nowych runów - sprawdź za 10 minut (inteligentne oczekiwanie)
-                        next_check = current_time + timedelta(seconds=INTELLIGENT_CHECK_INTERVAL)
-                        logger.info(f"Brak nowych runów. Następne sprawdzenie: {next_check.strftime('%Y-%m-%d %H:%M:%S')} UTC (za {INTELLIGENT_CHECK_INTERVAL/60:.0f} min)")
-                        last_check_time = current_time
-                        time.sleep(INTELLIGENT_CHECK_INTERVAL)
-                        continue
+                    # Brak nowych runów - sprawdź za check_interval_before (10 min)
+                    next_check = current_time + timedelta(seconds=check_interval_before)
+                    logger.info(f"Brak nowych runów. Następne sprawdzenie: {next_check.strftime('%Y-%m-%d %H:%M:%S')} UTC (za {check_interval_before/60:.0f} min)")
+                    time.sleep(check_interval_before)
+                    continue
             
             # Czekaj 1 minutę przed następnym sprawdzeniem
             time.sleep(60)

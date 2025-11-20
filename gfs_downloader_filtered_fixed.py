@@ -25,7 +25,7 @@ from tqdm import tqdm
 import warnings
 import logging
 from collections import deque
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs, unquote
 from datetime import datetime
 warnings.filterwarnings('ignore')
 
@@ -137,12 +137,140 @@ def wait_for_rate_limit():
         # Minimalne opóźnienie między zapytaniami (0.5s = 120/min)
         time.sleep(0.5)
 
-def build_grib_filter_url(date_str, hour_str, forecast_hour, resolution='0p25'):
+def load_parameters_config(config_file='config.ini'):
     """
-    Buduje URL dla GRIB Filter API z wybranymi parametrami.
-    UWAGA: URL może być bardzo długi - NOMADS może mieć limit ~2000 znaków.
+    Wczytuje konfigurację parametrów z config.ini.
+    Zwraca słownik mapujący: config_name -> {db_column, level_type, level_value, transformation}
+    oraz mapowanie cfgrib_name -> config_name
     """
-    base_url = f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_{resolution}.pl"
+    try:
+        config = configparser.ConfigParser()
+        config.read(config_file, encoding='utf-8')
+        
+        params_map = {}
+        cfgrib_to_config = {}  # Mapowanie nazw cfgrib na nazwy z konfiguracji
+        
+        if 'gfs_parameters' in config:
+            print(f"DEBUG load_parameters_config: Znaleziono sekcję [gfs_parameters] z {len(config['gfs_parameters'])} parametrami", flush=True)
+            for config_name, value in config['gfs_parameters'].items():
+                parts = [p.strip() for p in value.split(',')]
+                if len(parts) == 4:
+                    db_column, level_type, level_value, transformation = parts
+                    params_map[config_name] = {
+                        'db_column': db_column,
+                        'level_type': level_type,
+                        'level_value': int(level_value) if level_value.isdigit() else level_value,
+                        'transformation': transformation
+                    }
+                    
+                    # Mapowanie nazw cfgrib na nazwy z konfiguracji
+                    # cfgrib używa małych liter i innych nazw niż NOMADS
+                    cfgrib_name = None
+                    if config_name == 't2m':
+                        cfgrib_name = 't2m'
+                    elif config_name == 'd2m':
+                        cfgrib_name = 'd2m'
+                    elif config_name == 'r2':
+                        cfgrib_name = 'r2'
+                    elif config_name == 'u10':
+                        cfgrib_name = 'u10'
+                    elif config_name == 'v10':
+                        cfgrib_name = 'v10'
+                    elif config_name == 'u80':
+                        cfgrib_name = 'u'
+                    elif config_name == 'v80':
+                        cfgrib_name = 'v'
+                    elif config_name == 't80':
+                        cfgrib_name = 't'
+                    elif config_name == 'gust':
+                        cfgrib_name = 'gust'
+                    elif config_name == 'prmsl':
+                        cfgrib_name = 'prmsl'
+                    elif config_name == 'tp':
+                        cfgrib_name = 'tp'
+                    elif config_name == 'prate':
+                        cfgrib_name = 'prate'
+                    elif config_name == 'tcc':
+                        cfgrib_name = 'tcc'
+                    elif config_name == 'lcc':
+                        cfgrib_name = 'lcc'
+                    elif config_name == 'mcc':
+                        cfgrib_name = 'mcc'
+                    elif config_name == 'hcc':
+                        cfgrib_name = 'hcc'
+                    elif config_name == 'vis':
+                        cfgrib_name = 'vis'
+                    elif config_name == 'dswrf':
+                        cfgrib_name = 'dswrf'
+                    elif config_name == 'cape':
+                        cfgrib_name = 'cape'
+                    elif config_name == 'cin':
+                        cfgrib_name = 'cin'
+                    elif config_name == 'pwat':
+                        cfgrib_name = 'pwat'
+                    elif config_name == 't_850':
+                        cfgrib_name = 't'
+                    elif config_name == 'gh_850':
+                        cfgrib_name = 'gh'
+                    elif config_name == 'gh_500':
+                        cfgrib_name = 'gh'
+                    else:
+                        # Jeśli parametr nie jest w mapowaniu, użyj nazwy z config jako cfgrib_name
+                        print(f"DEBUG load_parameters_config: ⚠ Parametr '{config_name}' nie ma mapowania cfgrib_name - używam '{config_name}' jako cfgrib_name", flush=True)
+                        cfgrib_name = config_name
+                    
+                    if cfgrib_name:
+                        # Dla zmiennych z poziomami, dodaj poziom do klucza
+                        if level_type == 'isobaricInhPa' and isinstance(params_map[config_name]['level_value'], int):
+                            key = (cfgrib_name, level_type, params_map[config_name]['level_value'])
+                        elif level_type == 'heightAboveGround' and isinstance(params_map[config_name]['level_value'], int):
+                            key = (cfgrib_name, level_type, params_map[config_name]['level_value'])
+                        else:
+                            key = (cfgrib_name, level_type, 0)
+                        
+                        cfgrib_to_config[key] = config_name
+                        print(f"DEBUG load_parameters_config: Dodano mapowanie {key} -> {config_name} (db_column={params_map[config_name]['db_column']})", flush=True)
+        
+        print(f"DEBUG load_parameters_config: Utworzono {len(cfgrib_to_config)} mapowań cfgrib_to_config", flush=True)
+        return params_map, cfgrib_to_config
+    except Exception as e:
+        module_logger.warning(f"Nie udało się wczytać konfiguracji parametrów z {config_file}: {e}")
+        return {}, {}
+
+def apply_transformation(data, transformation):
+    """
+    Stosuje transformację do danych.
+    transformation: none, kelvin_to_celsius, pa_to_hpa, fraction_to_percent
+    """
+    if transformation == 'none':
+        return data
+    elif transformation == 'kelvin_to_celsius':
+        return data - 273.15
+    elif transformation == 'pa_to_hpa':
+        return data / 100.0
+    elif transformation == 'fraction_to_percent':
+        # Sprawdź czy wartości są w zakresie 0-1
+        try:
+            max_val = float(data.max().values)
+            if max_val <= 1.0:
+                return data * 100.0
+        except:
+            pass
+        return data
+    else:
+        return data
+
+def build_grib_filter_url(date_str, hour_str, forecast_hour, resolution='0p25', params_config=None):
+    """
+    Buduje URL dla GRIB Filter API z wybranymi parametrami z konfiguracji.
+    Format zgodny z dokumentacją NOMADS: https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs.pl
+    """
+    # Base URL - używa filter_gfs.pl (nie filter_gfs_0p25.pl)
+    base_url = f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs.pl"
+    
+    # Wczytaj konfigurację parametrów jeśli nie podano
+    if params_config is None:
+        params_config, _ = load_parameters_config()
     
     # Parametry URL
     params = {
@@ -150,24 +278,88 @@ def build_grib_filter_url(date_str, hour_str, forecast_hour, resolution='0p25'):
         'dir': f'/gfs.{date_str}/{hour_str}/atmos',
     }
     
-    # Dodaj poziomy izobaryczne (uproszczone nazwy)
-    for level in GRIB_FILTER_CONFIG['levels']:
-        # Konwertuj "1000_mb" na "1000_mb" (zachowaj format)
-        params[f'lev_{level}'] = 'on'
+    # Jeśli mamy konfigurację parametrów, użyj jej
+    if params_config:
+        # Mapowanie nazw GRIB na nazwy w API NOMADS
+        grib_to_nomads = {
+            't2m': 'TMP',
+            'd2m': 'DPT',
+            'r2': 'RH',
+            'u10': 'UGRD',
+            'v10': 'VGRD',
+            'u80': 'UGRD',
+            'v80': 'VGRD',
+            't80': 'TMP',
+            'gust': 'GUST',
+            'prmsl': 'PRMSL',
+            'tp': 'APCP',
+            'prate': 'PRATE',
+            'tcc': 'TCDC',
+            'lcc': 'LCDC',
+            'mcc': 'MCDC',
+            'hcc': 'HCDC',
+            'vis': 'VIS',
+            'dswrf': 'DSWRF',
+            'cape': 'CAPE',
+            'cin': 'CIN',
+            'pwat': 'PWAT',
+            't_850': 'TMP',
+            'gh_850': 'HGT',
+            'gh_500': 'HGT',
+        }
+        
+        # Zbierz unikalne kombinacje var+level
+        var_level_combos = set()
+        
+        for grib_name, config_data in params_config.items():
+            level_type = config_data['level_type']
+            level_value = config_data['level_value']
+            nomads_var = grib_to_nomads.get(grib_name, grib_name.upper())
+            
+            # Buduj klucz dla poziomu (format NOMADS)
+            if level_type == 'isobaricInhPa' and isinstance(level_value, int):
+                level_key = f'lev_{level_value}_mb'
+            elif level_type == 'heightAboveGround' and isinstance(level_value, int):
+                level_key = f'lev_{level_value}_m'
+            elif level_type == 'surface':
+                level_key = 'lev_surface'
+            elif level_type == 'meanSea':
+                level_key = 'lev_mean_sea_level'
+            elif level_type == 'entireAtmosphere':
+                level_key = 'lev_entire_atmosphere'
+            else:
+                continue  # Pomiń nieznane typy poziomów
+            
+            var_level_combos.add((nomads_var, level_key))
+        
+        # Dodaj parametry do URL (NOMADS wymaga var_ i lev_ osobno)
+        for nomads_var, level_key in var_level_combos:
+            params[f'var_{nomads_var}'] = 'on'
+            params[level_key] = 'on'
+    else:
+        # Fallback: użyj starej konfiguracji GRIB_FILTER_CONFIG
+        # Dodaj poziomy izobaryczne (uproszczone nazwy)
+        for level in GRIB_FILTER_CONFIG['levels']:
+            params[f'lev_{level}'] = 'on'
+        
+        # Dodaj poziomy powierzchniowe
+        for level in GRIB_FILTER_CONFIG['surface_levels']:
+            params[f'lev_{level}'] = 'on'
+        
+        # Dodaj zmienne atmosferyczne (dla poziomów izobarycznych)
+        for var in GRIB_FILTER_CONFIG['variables']:
+            params[f'var_{var}'] = 'on'
+        
+        # Dodaj zmienne powierzchniowe
+        for var in GRIB_FILTER_CONFIG['surface_variables']:
+            params[f'var_{var}'] = 'on'
     
-    # Dodaj poziomy powierzchniowe
-    for level in GRIB_FILTER_CONFIG['surface_levels']:
-        params[f'lev_{level}'] = 'on'
-    
-    # Dodaj zmienne atmosferyczne (dla poziomów izobarycznych)
-    for var in GRIB_FILTER_CONFIG['variables']:
-        params[f'var_{var}'] = 'on'
-    
-    # Dodaj zmienne powierzchniowe
-    for var in GRIB_FILTER_CONFIG['surface_variables']:
-        params[f'var_{var}'] = 'on'
-    
+    # Buduj URL
     url = f"{base_url}?{urlencode(params)}"
+    
+    # Loguj URL dla debugowania (tylko pierwsze 500 znaków)
+    if forecast_hour is not None and forecast_hour <= 1:
+        print(f"{get_timestamp()} - [f{forecast_hour:03d}] DEBUG GRIB Filter URL ({len(url)} znaków): {url[:500]}...", flush=True)
     
     # Sprawdź długość URL
     if len(url) > 2000:
@@ -180,11 +372,46 @@ def get_timestamp():
     """Zwraca timestamp w formacie YYYY-MM-DD HH:MM:SS"""
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-def download_grib_filtered(url, output_path, max_retries=3, forecast_hour=None):
+def download_grib_filtered(url_or_date_str, output_path, max_retries=3, forecast_hour=None, hour_str=None, resolution='0p25', params_config=None):
     """
-    Pobiera plik GRIB używając GRIB Filter API.
+    Pobiera plik GRIB używając GRIB Filter API (z filtrowaniem na serwerze).
+    Może przyjąć URL (string) lub date_str (wtedy buduje URL).
     Zwraca (success, file_size_bytes).
     """
+    # Jeśli pierwszy parametr to URL (zawiera 'http'), użyj go bezpośrednio
+    date_str = None
+    if isinstance(url_or_date_str, str) and url_or_date_str.startswith('http'):
+        url = url_or_date_str
+        # Spróbuj wyciągnąć date_str i hour_str z URL dla fallback
+        # URL format Filter API: ...?dir=%2Fgfs.20251120%2F12%2Fatmos&file=...
+        # Lub bezpośredni URL: .../gfs.{date_str}/{hour_str}/atmos/...
+        import re
+        
+        # Najpierw spróbuj z query string (Filter API)
+        parsed = urlparse(url_or_date_str)
+        query_params = parse_qs(parsed.query)
+        if 'dir' in query_params:
+            dir_param = unquote(query_params['dir'][0])
+            match = re.search(r'/gfs\.(\d{8})/(\d{2})/atmos', dir_param)
+            if match:
+                date_str = match.group(1)
+                if hour_str is None:
+                    hour_str = match.group(2)
+        
+        # Jeśli nie znaleziono w query string, spróbuj z path
+        if not date_str:
+            match = re.search(r'/gfs\.(\d{8})/(\d{2})/atmos/', url_or_date_str)
+            if match:
+                date_str = match.group(1)
+                if hour_str is None:
+                    hour_str = match.group(2)
+    else:
+        # W przeciwnym razie, zbuduj URL z parametrów
+        date_str = url_or_date_str
+        if hour_str is None:
+            raise ValueError("hour_str jest wymagany gdy podano date_str")
+        url = build_grib_filter_url(date_str, hour_str, forecast_hour, resolution, params_config)
+    
     fh_str = f"f{forecast_hour:03d}" if forecast_hour is not None else "?"
     
     for attempt in range(max_retries):
@@ -208,11 +435,42 @@ def download_grib_filtered(url, output_path, max_retries=3, forecast_hour=None):
                 continue
             
             if response.status_code != 200:
-                print(f"{get_timestamp()} - [{fh_str}] ✗ HTTP {response.status_code}", flush=True)
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                return False, 0
+                print(f"{get_timestamp()} - [{fh_str}] ✗ HTTP {response.status_code} z GRIB Filter API", flush=True)
+                
+                # FALLBACK: Jeśli Filter API zwraca 404, spróbuj bezpośredniego pobierania
+                if response.status_code == 404 and forecast_hour is not None:
+                    # Jeśli nie mamy date_str i hour_str, spróbuj wyciągnąć z URL jeszcze raz
+                    if not date_str or not hour_str:
+                        import re
+                        parsed = urlparse(url)
+                        query_params = parse_qs(parsed.query)
+                        if 'dir' in query_params:
+                            dir_param = unquote(query_params['dir'][0])
+                            match = re.search(r'/gfs\.(\d{8})/(\d{2})/atmos', dir_param)
+                            if match:
+                                date_str = match.group(1)
+                                hour_str = match.group(2)
+                    
+                    if date_str and hour_str:
+                        # Pobierz bezpośrednio plik GRIB (bez filtrowania)
+                        direct_url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date_str}/{hour_str}/atmos/gfs.t{hour_str}z.pgrb2.{resolution}.f{forecast_hour:03d}"
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠️ Filter API zwraca 404, próbuję bezpośredniego pobierania z {direct_url}...", flush=True)
+                    wait_for_rate_limit()
+                    response = requests.get(direct_url, timeout=300, stream=True)
+                    if response.status_code == 200:
+                        print(f"{get_timestamp()} - [{fh_str}] ✓ Bezpośrednie pobieranie działa, kontynuuję...", flush=True)
+                        # Kontynuuj z bezpośrednim pobieraniem (plik będzie większy, ale działa)
+                    else:
+                        print(f"{get_timestamp()} - [{fh_str}] ✗ Bezpośrednie pobieranie też zwraca {response.status_code}", flush=True)
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+                            continue
+                        return False, 0
+                else:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return False, 0
             
             # Zapisz plik
             print(f"{get_timestamp()} - [{fh_str}] Zapisuję plik...", flush=True)
@@ -259,12 +517,20 @@ def download_grib_filtered(url, output_path, max_retries=3, forecast_hour=None):
 def check_gfs_availability(date_str, hour_str, forecast_hour, verbose=False):
     """
     Sprawdza czy dana prognoza GFS jest dostępna.
+    Używa bezpośredniego URL do pliku .idx (index file) zamiast GRIB Filter API,
+    bo Filter API może zwracać 404 nawet jeśli plik istnieje.
     """
-    url = build_grib_filter_url(date_str, hour_str, forecast_hour)
+    # Sprawdź dostępność pliku .idx (index file) - jest zawsze dostępny jeśli plik GRIB istnieje
+    base_path = f"/pub/data/nccf/com/gfs/prod/gfs.{date_str}/{hour_str}/atmos/gfs.t{hour_str}z.pgrb2.0p25.f{forecast_hour:03d}"
+    idx_url = f"https://nomads.ncep.noaa.gov{base_path}.idx"
+    
+    # Alternatywnie sprawdź bezpośredni URL do pliku GRIB
+    grib_url = f"https://nomads.ncep.noaa.gov{base_path}"
     
     try:
         wait_for_rate_limit()
-        response = requests.head(url, timeout=10, allow_redirects=True)
+        # Najpierw sprawdź plik .idx (szybszy i bardziej niezawodny)
+        response = requests.head(idx_url, timeout=10, allow_redirects=True)
         
         if response.status_code == 429:
             retry_after = int(response.headers.get('Retry-After', 60))
@@ -272,12 +538,21 @@ def check_gfs_availability(date_str, hour_str, forecast_hour, verbose=False):
                 module_logger.debug(f"HTTP 429 - czekam {retry_after}s")
             time.sleep(retry_after)
             wait_for_rate_limit()
-            response = requests.head(url, timeout=10, allow_redirects=True)
+            response = requests.head(idx_url, timeout=10, allow_redirects=True)
         
         if response.status_code == 200:
             if verbose:
-                module_logger.debug(f"✓ Dane dostępne (f{forecast_hour:03d})")
+                module_logger.debug(f"✓ Dane dostępne (f{forecast_hour:03d}) - plik .idx istnieje")
             return True
+        
+        # Jeśli .idx nie istnieje, sprawdź bezpośrednio plik GRIB
+        if response.status_code == 404:
+            wait_for_rate_limit()
+            response = requests.head(grib_url, timeout=10, allow_redirects=True)
+            if response.status_code == 200:
+                if verbose:
+                    module_logger.debug(f"✓ Dane dostępne (f{forecast_hour:03d}) - plik GRIB istnieje")
+                return True
             
     except requests.exceptions.Timeout:
         if verbose:
@@ -415,14 +690,32 @@ def find_latest_gfs_run(engine=None):
     
     return None, None, None
 
-def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat_max, lon_min, lon_max, engine):
+def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat_max, lon_min, lon_max, engine, params_config=None, cfgrib_to_config=None, csv_backup_dir=None):
     """
     Przetwarza plik GRIB (pofiltrowany) i zapisuje do bazy danych.
+    Używa konfiguracji parametrów z config.ini - tylko parametry zdefiniowane w konfiguracji są przetwarzane!
     
     POPRAWKA: Otwiera plik dla KAŻDEGO typeOfLevel osobno,
     ponieważ xarray/cfgrib nie może otworzyć wszystkich poziomów naraz.
     """
     fh_str = f"f{forecast_hour:03d}"
+    
+    # Wczytaj konfigurację jeśli nie podano
+    if params_config is None or cfgrib_to_config is None:
+        params_config, cfgrib_to_config = load_parameters_config()
+    
+    # DEBUG: Pokaż mapowanie
+    print(f"{get_timestamp()} - [{fh_str}] DEBUG: Załadowano {len(params_config)} parametrów z konfiguracji", flush=True)
+    print(f"{get_timestamp()} - [{fh_str}] DEBUG: Mapowanie cfgrib_to_config ma {len(cfgrib_to_config)} kluczy", flush=True)
+    if cfgrib_to_config:
+        print(f"{get_timestamp()} - [{fh_str}] DEBUG: Wszystkie klucze w cfgrib_to_config:", flush=True)
+        for key, config_name in cfgrib_to_config.items():
+            db_col = params_config.get(config_name, {}).get('db_column', '?')
+            print(f"{get_timestamp()} - [{fh_str}]   {key} -> {config_name} (db_column={db_col})", flush=True)
+    
+    if not params_config:
+        print(f"{get_timestamp()} - [{fh_str}] ⚠ Brak konfiguracji parametrów - używam domyślnych", flush=True)
+    
     try:
         # Sprawdź czy plik istnieje i ma rozmiar
         if not os.path.exists(grib_path):
@@ -435,33 +728,158 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
             return 0
         
         print(f"{get_timestamp()} - [{fh_str}] Otwieranie pliku GRIB ({file_size / (1024*1024):.1f} MB)...", flush=True)
-        # Lista typów poziomów, które mogą być w pliku
-        type_of_levels = [
-            'isobaricInhPa',        # Poziomy izobaryczne (1000, 850, 500 mb, etc.)
-            'surface',              # Powierzchnia
-            'meanSea',              # Poziom morza
-            'heightAboveGround',    # Wysokość nad ziemią (2m, 10m, 80m, 100m)
-            'tropopause',           # Tropopauza
-            'maxWind',              # Maksymalny poziom wiatru
-            'entireAtmosphere',     # Cała atmosfera
-        ]
         
         all_data_vars = {}
         coords_dict = None
         
+        # Lista poziomów do otwarcia - dla heightAboveGround otwieramy każdy poziom osobno
+        # Najpierw sprawdź jakie poziomy heightAboveGround są w konfiguracji
+        height_levels = []
+        isobaric_levels = []
+        if params_config:
+            for config_name, param_info in params_config.items():
+                level_type = param_info.get('level_type')
+                level_value = param_info.get('level_value')
+                if level_type == 'heightAboveGround' and isinstance(level_value, int):
+                    if level_value not in height_levels:
+                        height_levels.append(level_value)
+                elif level_type == 'isobaricInhPa' and isinstance(level_value, int):
+                    if level_value not in isobaric_levels:
+                        isobaric_levels.append(level_value)
+        
+        # Lista typów poziomów, które mogą być w pliku
+        type_of_levels = [
+            ('isobaricInhPa', None),        # Poziomy izobaryczne (będą filtrowane po konkretnych poziomach)
+            ('surface', None),              # Powierzchnia
+            ('meanSea', None),              # Poziom morza
+            ('tropopause', None),           # Tropopauza
+            ('maxWind', None),              # Maksymalny poziom wiatru
+            ('entireAtmosphere', None),     # Cała atmosfera
+        ]
+        
+        # Dodaj heightAboveGround dla każdego poziomu osobno
+        for height in height_levels:
+            type_of_levels.append(('heightAboveGround', height))
+        
         # Otwórz plik dla każdego typeOfLevel osobno
-        for level_type in type_of_levels:
+        for level_type, level_value in type_of_levels:
             try:
-                print(f"{get_timestamp()} - [{fh_str}] Próbuję otworzyć level: {level_type}...", flush=True)
-                ds = xr.open_dataset(
-                    grib_path,
-                    engine='cfgrib',
-                    backend_kwargs={
-                        'filter_by_keys': {'typeOfLevel': level_type},
-                        'indexpath': '',
-                        'errors': 'ignore'
-                    }
-                )
+                if level_type == 'heightAboveGround' and level_value is not None:
+                    print(f"{get_timestamp()} - [{fh_str}] Próbuję otworzyć level: {level_type} (height={level_value}m)...", flush=True)
+                    filter_keys = {'typeOfLevel': level_type, 'level': level_value, 'stepType': 'instant'}
+                elif level_type == 'isobaricInhPa' and isobaric_levels:
+                    # Dla isobaricInhPa, otwieramy każdy poziom osobno
+                    # Przetwarzamy je w pętli poniżej
+                    continue
+                else:
+                    print(f"{get_timestamp()} - [{fh_str}] Próbuję otworzyć level: {level_type}...", flush=True)
+                    filter_keys = {'typeOfLevel': level_type}
+                    if level_type == 'surface':
+                        filter_keys['stepType'] = 'instant'
+                
+                try:
+                    ds = xr.open_dataset(
+                        grib_path,
+                        engine='cfgrib',
+                        backend_kwargs={
+                            'filter_by_keys': filter_keys,
+                            'indexpath': '',
+                            'errors': 'ignore'
+                        }
+                    )
+                except Exception as e:
+                    # Jeśli nie udało się z stepType='instant', spróbuj bez stepType
+                    if level_type == 'surface':
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Nie udało się z stepType='instant', próbuję bez stepType...", flush=True)
+                        filter_keys_no_step = {'typeOfLevel': level_type}
+                        ds = xr.open_dataset(
+                            grib_path,
+                            engine='cfgrib',
+                            backend_kwargs={
+                                'filter_by_keys': filter_keys_no_step,
+                                'indexpath': '',
+                                'errors': 'ignore'
+                            }
+                        )
+                    elif level_type == 'heightAboveGround' and level_value is not None:
+                        # Spróbuj bez stepType
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Nie udało się z stepType='instant', próbuję bez stepType...", flush=True)
+                        filter_keys_no_step = {'typeOfLevel': level_type, 'level': level_value}
+                        ds = xr.open_dataset(
+                            grib_path,
+                            engine='cfgrib',
+                            backend_kwargs={
+                                'filter_by_keys': filter_keys_no_step,
+                                'indexpath': '',
+                                'errors': 'ignore'
+                            }
+                        )
+                    else:
+                        raise
+                
+                # Otwórz isobaricInhPa dla każdego poziomu osobno
+                if level_type == 'isobaricInhPa' and isobaric_levels:
+                    for isobaric_level in isobaric_levels:
+                        try:
+                            print(f"{get_timestamp()} - [{fh_str}] Próbuję otworzyć level: {level_type} ({isobaric_level} mb)...", flush=True)
+                            filter_keys_iso = {'typeOfLevel': 'isobaricInhPa', 'level': isobaric_level}
+                            ds_iso = xr.open_dataset(
+                                grib_path,
+                                engine='cfgrib',
+                                backend_kwargs={
+                                    'filter_by_keys': filter_keys_iso,
+                                    'indexpath': '',
+                                    'errors': 'ignore'
+                                }
+                            )
+                            print(f"{get_timestamp()} - [{fh_str}] ✓ Otworzono {level_type} {isobaric_level} mb, zmienne: {list(ds_iso.data_vars.keys())}", flush=True)
+                            
+                            # Zapisz współrzędne (latitude, longitude) z pierwszego datasetu
+                            if coords_dict is None:
+                                coords_dict = {
+                                    'latitude': ds_iso.latitude.values,
+                                    'longitude': ds_iso.longitude.values
+                                }
+                            
+                            # Przetwarzaj zmienne dla tego poziomu izobarycznego
+                            print(f"{get_timestamp()} - [{fh_str}] DEBUG: Zmienne w {level_type} {isobaric_level} mb: {list(ds_iso.data_vars.keys())}", flush=True)
+                            for var_name in ds_iso.data_vars:
+                                var_data = ds_iso[var_name]
+                                var_level_type = 'isobaricInhPa'
+                                level_val = isobaric_level  # Użyj poziomu z filtra
+                                
+                                # Przetwarzaj zmienną (użyj tego samego kodu co poniżej)
+                                # Sprawdź czy ta zmienna jest w konfiguracji
+                                config_name = None
+                                db_column = None
+                                transformation = None
+                                
+                                key = (var_name, var_level_type, level_val)
+                                print(f"{get_timestamp()} - [{fh_str}] DEBUG: Sprawdzam klucz dla isobaric: {key}", flush=True)
+                                if key in cfgrib_to_config:
+                                    config_name = cfgrib_to_config[key]
+                                    print(f"{get_timestamp()} - [{fh_str}] DEBUG: ✓ Znaleziono mapowanie: {key} -> {config_name}", flush=True)
+                                    if config_name in params_config:
+                                        db_column = params_config[config_name]['db_column']
+                                        transformation = params_config[config_name]['transformation']
+                                
+                                if params_config and (not config_name or not db_column):
+                                    print(f"{get_timestamp()} - [{fh_str}] DEBUG: Pomijam {var_name} (key: {key}) - nie znaleziono w cfgrib_to_config", flush=True)
+                                    continue
+                                
+                                # Zapisz zmienną
+                                all_data_vars[db_column] = {
+                                    'data': var_data,
+                                    'transformation': transformation,
+                                    'config_name': config_name
+                                }
+                            
+                            ds_iso.close()
+                        except Exception as e:
+                            print(f"{get_timestamp()} - [{fh_str}] ⚠ {level_type} {isobaric_level} mb nie znaleziony: {e}", flush=True)
+                            continue
+                    continue  # Przejdź do następnego poziomu
+                
                 print(f"{get_timestamp()} - [{fh_str}] ✓ Otworzono {level_type}, zmienne: {list(ds.data_vars.keys())}", flush=True)
                 
                 # Zapisz współrzędne (latitude, longitude) z pierwszego datasetu
@@ -471,52 +889,135 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
                         'longitude': ds.longitude.values
                     }
                 
-                # Zbierz wszystkie zmienne z tego poziomu
+                # Zbierz wszystkie zmienne z tego poziomu - TYLKO TE Z KONFIGURACJI!
+                print(f"{get_timestamp()} - [{fh_str}] DEBUG: Zmienne w {level_type}: {list(ds.data_vars.keys())}", flush=True)
                 for var_name in ds.data_vars:
                     var_data = ds[var_name]
                     
-                    # Dodaj sufiks z poziomem do nazwy zmiennej
-                    if 'isobaricInhPa' in var_data.dims:
-                        # Dla poziomów izobarycznych dodaj _XXX_mb
-                        level_val = var_data.coords['isobaricInhPa'].values
-                        if isinstance(level_val, np.ndarray) and level_val.size > 0:
-                            if level_val.size == 1:
-                                level_val = level_val.item()
-                            else:
-                                # Jeśli jest wiele poziomów, weź pierwszy
-                                level_val = level_val[0]
-                        
-                        # Walidacja poziomu (999 mb nie istnieje - to błąd w danych)
-                        level_val = float(level_val)
-                        # Prawidłowe poziomy izobaryczne GFS: 1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 70, 50, 30, 20, 10
-                        valid_isobaric_levels = [10, 20, 30, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 925, 950, 975, 1000]
-                        if level_val < 10 or level_val > 1100 or level_val not in valid_isobaric_levels:
-                            print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam nieprawidłowy poziom: {level_val} mb dla {var_name}", flush=True)
-                            continue
-                        
-                        full_var_name = f"{var_name}_{int(level_val)}_mb"
-                    elif 'heightAboveGround' in var_data.dims:
-                        # Dla wysokości nad ziemią dodaj _XXm
-                        height_val = var_data.coords['heightAboveGround'].values
-                        if isinstance(height_val, np.ndarray) and height_val.size > 0:
-                            if height_val.size == 1:
-                                height_val = height_val.item()
-                            else:
-                                height_val = height_val[0]
-                        
-                        # Walidacja wysokości (prawidłowe: 2, 10, 80, 100, etc.)
-                        height_val = float(height_val)
-                        # Prawidłowe wysokości nad ziemią: 2, 10, 80, 100, etc. (nie 0, nie 999, nie ujemne)
-                        if height_val <= 0 or height_val > 1000 or height_val == 999:
-                            print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam nieprawidłową wysokość: {height_val} m dla {var_name}", flush=True)
-                            continue
-                        
-                        full_var_name = f"{var_name}_{int(height_val)}m"
+                    # Określ poziom zmiennej
+                    var_level_type = level_type
+                    # Dla heightAboveGround z konkretnym poziomem, użyj tego poziomu (nie nadpisuj!)
+                    if level_type == 'heightAboveGround' and level_value is not None:
+                        level_val = level_value
                     else:
-                        # Dla pozostałych (surface, meanSea, etc.) bez sufiksu
-                        full_var_name = var_name
+                        # Wyznacz level_val z danych
+                        if 'isobaricInhPa' in var_data.dims:
+                            level_vals = var_data.coords['isobaricInhPa'].values
+                            if isinstance(level_vals, np.ndarray) and level_vals.size > 0:
+                                if level_vals.size == 1:
+                                    level_val = int(level_vals.item())
+                                else:
+                                    # Jeśli jest wiele poziomów, sprawdź każdy
+                                    level_vals = [int(v) for v in level_vals]
+                                    level_val = level_vals  # Lista poziomów
+                                    print(f"{get_timestamp()} - [{fh_str}] DEBUG: {var_name} ma wiele poziomów isobaricInhPa: {level_vals}", flush=True)
+                        elif 'heightAboveGround' in var_data.dims:
+                            height_vals = var_data.coords['heightAboveGround'].values
+                            if isinstance(height_vals, np.ndarray) and height_vals.size > 0:
+                                if height_vals.size == 1:
+                                    level_val = int(height_vals.item())
+                                else:
+                                    height_vals = [int(v) for v in height_vals]
+                                    level_val = height_vals  # Lista poziomów
+                                    print(f"{get_timestamp()} - [{fh_str}] DEBUG: {var_name} ma wiele poziomów heightAboveGround: {height_vals}", flush=True)
+                        else:
+                            level_val = 0  # surface, meanSea, etc.
                     
-                    all_data_vars[full_var_name] = var_data
+                    # DEBUG: Pokaż szczegóły zmiennej
+                    print(f"{get_timestamp()} - [{fh_str}] DEBUG: Przetwarzam {var_name}, level_type={var_level_type}, level_val={level_val}", flush=True)
+                    
+                    # Sprawdź czy ta zmienna jest w konfiguracji
+                    # Szukaj w cfgrib_to_config: (cfgrib_name, level_type, level_value) -> config_name
+                    config_name = None
+                    db_column = None
+                    transformation = None
+                    
+                    if isinstance(level_val, list):
+                        # Wiele poziomów - sprawdź każdy
+                        for lv in level_val:
+                            key = (var_name, var_level_type, lv)
+                            print(f"{get_timestamp()} - [{fh_str}] DEBUG: Sprawdzam klucz dla wielu poziomów: {key}", flush=True)
+                            if key in cfgrib_to_config:
+                                config_name = cfgrib_to_config[key]
+                                print(f"{get_timestamp()} - [{fh_str}] DEBUG: ✓ Znaleziono mapowanie: {key} -> {config_name}", flush=True)
+                                if config_name in params_config:
+                                    db_column = params_config[config_name]['db_column']
+                                    transformation = params_config[config_name]['transformation']
+                                    level_val = lv  # Użyj tego poziomu
+                                    break
+                    else:
+                        # Jeden poziom
+                        key = (var_name, var_level_type, level_val if level_val is not None else 0)
+                        print(f"{get_timestamp()} - [{fh_str}] DEBUG: Sprawdzam klucz dla jednego poziomu: {key}", flush=True)
+                        if key in cfgrib_to_config:
+                            config_name = cfgrib_to_config[key]
+                            print(f"{get_timestamp()} - [{fh_str}] DEBUG: ✓ Znaleziono mapowanie: {key} -> {config_name}", flush=True)
+                            if config_name in params_config:
+                                db_column = params_config[config_name]['db_column']
+                                transformation = params_config[config_name]['transformation']
+                    
+                    # Jeśli zmienna nie jest w konfiguracji, pomiń ją (chyba że brak konfiguracji - wtedy użyj domyślnych)
+                    if params_config and (not config_name or not db_column):
+                        # DEBUG: Sprawdź dlaczego nie znaleziono mapowania
+                        if isinstance(level_val, list):
+                            debug_key = (var_name, var_level_type, level_val[0] if level_val else 0)
+                        else:
+                            debug_key = (var_name, var_level_type, level_val if level_val is not None else 0)
+                        # Sprawdź czy może być problem z typem level_val
+                        if level_val is None:
+                            debug_key_alt = (var_name, var_level_type, 0)
+                            if debug_key_alt in cfgrib_to_config:
+                                print(f"{get_timestamp()} - [{fh_str}] DEBUG: Znaleziono alternatywny klucz {debug_key_alt} dla {var_name}", flush=True)
+                                config_name = cfgrib_to_config[debug_key_alt]
+                                if config_name in params_config:
+                                    db_column = params_config[config_name]['db_column']
+                                    transformation = params_config[config_name]['transformation']
+                                    level_val = 0
+                        if not config_name or not db_column:
+                            print(f"{get_timestamp()} - [{fh_str}] DEBUG: Pomijam {var_name} (key: {debug_key}) - nie znaleziono w cfgrib_to_config", flush=True)
+                            # DEBUG: Pokaż podobne klucze w cfgrib_to_config
+                            similar_keys = [k for k in cfgrib_to_config.keys() if k[0] == var_name or k[1] == var_level_type]
+                            if similar_keys:
+                                print(f"{get_timestamp()} - [{fh_str}] DEBUG: Podobne klucze w cfgrib_to_config: {similar_keys[:5]}", flush=True)
+                            continue
+                    
+                    # Jeśli jest wiele poziomów, wybierz tylko ten z konfiguracji
+                    if isinstance(level_val, list):
+                        # Wybierz tylko poziom z konfiguracji
+                        if var_level_type == 'isobaricInhPa':
+                            var_data = var_data.sel(isobaricInhPa=level_val)
+                        elif var_level_type == 'heightAboveGround':
+                            var_data = var_data.sel(heightAboveGround=level_val)
+                    
+                    # Walidacja poziomu
+                    if level_val is not None:
+                        if var_level_type == 'isobaricInhPa':
+                            if level_val in [999, 995, 996, 997, 998] or level_val == 0:
+                                continue
+                        elif var_level_type == 'heightAboveGround':
+                            if level_val in [0, 999, 995, 996, 997, 998]:
+                                continue
+                    
+                    # Jeśli brak konfiguracji, użyj domyślnej nazwy z sufiksem
+                    if not params_config or not db_column:
+                        # Fallback: dodaj sufiks z poziomem do nazwy zmiennej
+                        if 'isobaricInhPa' in var_data.dims:
+                            level_val_float = float(level_val) if level_val is not None else 0
+                            full_var_name = f"{var_name}_{int(level_val_float)}_mb"
+                        elif 'heightAboveGround' in var_data.dims:
+                            level_val_float = float(level_val) if level_val is not None else 0
+                            full_var_name = f"{var_name}_{int(level_val_float)}m"
+                        else:
+                            full_var_name = var_name
+                        db_column = full_var_name
+                        transformation = 'none'
+                    
+                    # Zapisz zmienną z nazwą kolumny bazy jako klucz
+                    all_data_vars[db_column] = {
+                        'data': var_data,
+                        'transformation': transformation,
+                        'config_name': config_name
+                    }
                 
                 ds.close()
                 
@@ -545,8 +1046,12 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
             print(f"{get_timestamp()} - [{fh_str}] Wycinanie regionu geograficznego...", flush=True)
             
             vars_region = {}
-            for var_name, var_data in all_data_vars.items():
+            for db_column, var_info in all_data_vars.items():
                 try:
+                    var_data = var_info['data']
+                    transformation = var_info['transformation']
+                    config_name = var_info['config_name']
+                    
                     if 'latitude' not in var_data.dims or 'longitude' not in var_data.dims:
                         continue
                     
@@ -556,34 +1061,192 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
                         longitude=slice(lon_min, lon_max)
                     )
                     
-                    vars_region[var_name.lower()] = var_region
+                    # TRANSFORMACJE DANYCH - używamy transformacji z konfiguracji!
+                    var_region = apply_transformation(var_region, transformation)
+                    if transformation != 'none':
+                        print(f"{get_timestamp()} - [{fh_str}] Transformacja: {config_name} -> {db_column} ({transformation})", flush=True)
+                    
+                    # Zapisz z nazwą kolumny bazy jako klucz
+                    vars_region[db_column] = var_region
                     
                 except Exception as e:
-                    print(f"{get_timestamp()} - [{fh_str}] ⚠ Błąd wycinania {var_name}: {e}", flush=True)
+                    print(f"{get_timestamp()} - [{fh_str}] ⚠ Błąd wycinania {db_column}: {e}", flush=True)
                     continue
             
             if not vars_region:
                 print(f"{get_timestamp()} - [{fh_str}] ✗ Brak zmiennych po wycięciu regionu", flush=True)
                 return 0
             
-            # Utwórz xarray Dataset z wszystkich zmiennych
-            print(f"{get_timestamp()} - [{fh_str}] Tworzenie xarray Dataset z {len(vars_region)} zmiennych...", flush=True)
-            ds_combined = xr.Dataset(vars_region)
+            # KONWERSJA: Konwertuj każdą zmienną osobno i łącz przez merge (jak w professional version)
+            # To unika problemów z MultiIndex i sufiksami _m0, _m1, etc.
+            print(f"{get_timestamp()} - [{fh_str}] Konwertowanie {len(vars_region)} zmiennych do DataFrame...", flush=True)
+            
+            df = None
+            coords = ['latitude', 'longitude']  # Wspólne współrzędne
+            
+            for db_column, var_data in vars_region.items():
+                try:
+                    # Sprawdź wymiary zmiennej - jeśli ma więcej niż 2 wymiary (lat, lon), może być problem
+                    dims = var_data.dims
+                    dim_sizes = {dim: var_data.sizes[dim] for dim in dims}
+                    
+                    # Sprawdź czy zmienna nie ma zbyt wielu wymiarów (może mieć wszystkie poziomy)
+                    total_size = 1
+                    for size in dim_sizes.values():
+                        total_size *= size
+                    
+                    # Jeśli zmienna jest zbyt duża (> 100M elementów), pomiń lub wybierz tylko jeden poziom
+                    if total_size > 100_000_000:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam {db_column} - zbyt duża ({total_size:,} elementów, wymiary: {dim_sizes})", flush=True)
+                        continue
+                    
+                    # Jeśli zmienna ma wymiar isobaricInhPa lub heightAboveGround z wieloma wartościami,
+                    # wybierz tylko pierwszą wartość (powinna być już wyfiltrowana, ale sprawdźmy)
+                    # UWAGA: Po wyfiltrowaniu przez filter_by_keys, wymiar może już nie istnieć, więc sprawdź czy istnieje
+                    if 'isobaricInhPa' in dims and dim_sizes.get('isobaricInhPa', 0) > 1:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ {db_column} ma {dim_sizes['isobaricInhPa']} poziomów izobarycznych - wybieram pierwszy", flush=True)
+                        try:
+                            var_data = var_data.isel(isobaricInhPa=0)
+                            # Po isel, zaktualizuj dims
+                            dims = var_data.dims
+                            dim_sizes = {dim: var_data.sizes[dim] for dim in dims}
+                        except Exception as e:
+                            print(f"{get_timestamp()} - [{fh_str}] ⚠ Błąd przy isel(isobaricInhPa=0): {e}", flush=True)
+                    elif 'heightAboveGround' in dims and dim_sizes.get('heightAboveGround', 0) > 1:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ {db_column} ma {dim_sizes['heightAboveGround']} poziomów wysokości - wybieram pierwszy", flush=True)
+                        try:
+                            var_data = var_data.isel(heightAboveGround=0)
+                            # Po isel, zaktualizuj dims
+                            dims = var_data.dims
+                            dim_sizes = {dim: var_data.sizes[dim] for dim in dims}
+                        except Exception as e:
+                            print(f"{get_timestamp()} - [{fh_str}] ⚠ Błąd przy isel(heightAboveGround=0): {e}", flush=True)
+                    
+                    # Konwertuj pojedynczą zmienną do DataFrame
+                    # Użyj stack() tylko dla wymiarów które nie są lat/lon
+                    non_coord_dims = [d for d in dims if d not in ['latitude', 'longitude']]
+                    
+                    if non_coord_dims:
+                        # Jeśli są dodatkowe wymiary, usuń je przez wybranie pierwszej wartości
+                        for dim in non_coord_dims:
+                            if dim_sizes.get(dim, 0) > 1:
+                                var_data = var_data.isel({dim: 0})
+                    
+                    tmp = var_data.to_dataframe().reset_index()
+                    
+                    # Sprawdź które współrzędne są dostępne
+                    available_coords = [c for c in coords if c in tmp.columns]
+                    
+                    # Jeśli nie ma współrzędnych, pomiń
+                    if not available_coords:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam {db_column} - brak współrzędnych", flush=True)
+                        continue
+                    
+                    # Wybierz tylko potrzebne kolumny (współrzędne + wartość)
+                    # Nazwa kolumny z wartością to nazwa zmiennej cfgrib (np. 't', 'gh', 'u10')
+                    value_col = None
+                    for col in tmp.columns:
+                        if col not in available_coords and col not in ['time', 'valid_time', 'step', 'isobaricInhPa', 'heightAboveGround', 'stepType']:
+                            value_col = col
+                            break
+                    
+                    if value_col is None:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam {db_column} - brak kolumny wartości. Kolumny: {list(tmp.columns)}", flush=True)
+                        continue
+                    
+                    # DEBUG: Sprawdź czy value_col ma wartości
+                    if tmp[value_col].isna().all():
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam {db_column} - kolumna {value_col} ma same NaN", flush=True)
+                        continue
+                    
+                    # Wybierz tylko potrzebne kolumny
+                    cols_to_keep = available_coords + [value_col]
+                    tmp = tmp[cols_to_keep]
+                    
+                    # Sprawdź rozmiar przed merge
+                    if len(tmp) > 10_000_000:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam {db_column} - zbyt dużo wierszy ({len(tmp):,})", flush=True)
+                        continue
+                    
+                    # Zmień nazwę kolumny wartości na nazwę kolumny bazy
+                    if value_col != db_column:
+                        tmp.rename(columns={value_col: db_column}, inplace=True)
+                    
+                    # DEBUG: Sprawdź czy są wartości w kolumnie
+                    non_null_count = tmp[db_column].notna().sum()
+                    if non_null_count == 0:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Pomijam {db_column} - brak wartości (wszystkie NaN)", flush=True)
+                        continue
+                    
+                    print(f"{get_timestamp()} - [{fh_str}] ✓ {db_column}: {non_null_count}/{len(tmp)} wartości nie-NaN", flush=True)
+                    
+                    # Połącz z głównym DataFrame
+                    if df is None:
+                        df = tmp
+                    else:
+                        # Sprawdź rozmiar przed merge
+                        if len(df) > 1_000_000 or len(tmp) > 1_000_000:
+                            print(f"{get_timestamp()} - [{fh_str}] ⚠ Duże DataFrames przed merge: df={len(df):,}, tmp={len(tmp):,}", flush=True)
+                        
+                        # Merge na podstawie współrzędnych - sprawdź czy nie ma konfliktów nazw
+                        common_cols = set(df.columns) & set(tmp.columns)
+                        common_cols.discard('latitude')
+                        common_cols.discard('longitude')
+                        
+                        if common_cols:
+                            # Są wspólne kolumny (poza współrzędnymi) - użyj suffixes
+                            df = df.merge(tmp, on=available_coords, how='outer', suffixes=('', '_dup'))
+                            # Usuń kolumny z _dup
+                            dup_cols = [c for c in df.columns if c.endswith('_dup')]
+                            if dup_cols:
+                                df = df.drop(columns=dup_cols)
+                        else:
+                            # Brak konfliktów - normalny merge
+                            df = df.merge(tmp, on=available_coords, how='outer')
+                    
+                except MemoryError as e:
+                    print(f"{get_timestamp()} - [{fh_str}] ⚠ BŁĄD PAMIĘCI przy konwersji {db_column}: {e}", flush=True)
+                    continue
+                except Exception as e:
+                    error_msg = str(e)
+                    if 'Unable to allocate' in error_msg or 'MemoryError' in error_msg:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ BŁĄD PAMIĘCI przy konwersji {db_column}: {error_msg[:200]}", flush=True)
+                    else:
+                        print(f"{get_timestamp()} - [{fh_str}] ⚠ Błąd konwersji {db_column}: {error_msg[:200]}", flush=True)
+                    continue
             
             # Zwolnij pamięć
             del vars_region, all_data_vars
             import gc
             gc.collect()
             
-            print(f"{get_timestamp()} - [{fh_str}] Konwertowanie do DataFrame...", flush=True)
+            if df is None or len(df) == 0:
+                print(f"{get_timestamp()} - [{fh_str}] ✗ Brak danych po konwersji", flush=True)
+                return 0
             
-            # Konwertuj cały dataset do DataFrame na raz (EFEKTYWNIE!)
-            df = ds_combined.to_dataframe().reset_index()
+            # Sprawdź czy są kolumny z nieprawidłowymi sufiksami
+            suspicious_cols = [c for c in df.columns if any(c.lower().endswith(f'_m{i}') for i in range(1000))]
+            if suspicious_cols:
+                print(f"{get_timestamp()} - [{fh_str}] ⚠ UWAGA: Znaleziono podejrzane kolumny z sufiksami _m*: {suspicious_cols[:10]}...", flush=True)
+                print(f"{get_timestamp()} - [{fh_str}] ⚠ To może być problem z MultiIndex lub duplikatami podczas merge!", flush=True)
             
             # Dodaj metadane
             df['run_time'] = run_time
             df['forecast_time'] = forecast_time
+            df['created_at'] = datetime.utcnow()
             df.rename(columns={'latitude': 'lat', 'longitude': 'lon'}, inplace=True)
+            
+            # Oblicz wind_speed i wind_dir z u10 i v10
+            if 'u10' in df.columns and 'v10' in df.columns:
+                df['wind_speed'] = np.sqrt(df['u10']**2 + df['v10']**2)
+                df['wind_dir'] = (270 - np.arctan2(df['v10'], df['u10']) * 180 / np.pi) % 360
+                print(f"{get_timestamp()} - [{fh_str}] ✓ Obliczono wind_speed i wind_dir z u10 i v10", flush=True)
+            
+            # Zaokrąglij wszystkie kolumny numeryczne do 2 miejsc po przecinku (oprócz id jeśli istnieje)
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                if col not in ['id']:  # Nie zaokrąglaj ID jeśli istnieje
+                    df[col] = df[col].round(2)
             
             # Usuń kolumny które nie powinny być w bazie (np. isobaricInhPa, heightAboveGround jako kolumny)
             cols_to_drop = [c for c in df.columns if c in ['isobaricInhPa', 'heightAboveGround', 'time', 'valid_time']]
@@ -591,12 +1254,18 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
                 df = df.drop(columns=cols_to_drop)
             
             # Usuń kolumny z nieprawidłowymi poziomami (np. m999, m0, 999, etc.)
+            # WAŻNE: Usuń wszystkie kolumny z sufiksami _m0, _m1, _m2, ..., _m999 (to są indeksy z MultiIndex)
+            import re
             invalid_patterns = ['_m999', '_m0_', '_999_', '_999m', '_999mb', 'm999', 'm0', '_0m', '_0_mb']
             invalid_cols = [c for c in df.columns if any(pattern in c.lower() for pattern in invalid_patterns)]
+            # Usuń wszystkie kolumny które kończą się na _m + liczba (np. _m0, _m1, _m999)
+            invalid_cols.extend([c for c in df.columns if re.search(r'_m\d+$', str(c))])
             # Dodatkowo usuń kolumny z poziomem 999 (nieprawidłowy poziom)
             invalid_cols.extend([c for c in df.columns if '_999' in c.lower() and c not in invalid_cols])
+            # Usuń duplikaty
+            invalid_cols = list(set(invalid_cols))
             if invalid_cols:
-                print(f"{get_timestamp()} - [{fh_str}] ⚠ Usuwam nieprawidłowe kolumny: {invalid_cols}", flush=True)
+                print(f"{get_timestamp()} - [{fh_str}] ⚠ Usuwam nieprawidłowe kolumny ({len(invalid_cols)}): {invalid_cols[:20]}...", flush=True)
                 df = df.drop(columns=invalid_cols)
             
             # Zaokrąglij wartości numeryczne do 2 miejsc po przecinku
@@ -605,15 +1274,29 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
                 if col not in ['lat', 'lon']:  # Nie zaokrąglaj współrzędnych
                     df[col] = df[col].round(2)
             
-            # Usuń wiersze z samymi NaN (poza lat/lon/run_time/forecast_time)
+            # DEBUG: Sprawdź kolumny i wartości przed usunięciem NaN
+            print(f"{get_timestamp()} - [{fh_str}] DEBUG: Kolumny w DataFrame: {list(df.columns)}", flush=True)
             data_cols = [c for c in df.columns if c not in ['lat', 'lon', 'run_time', 'forecast_time']]
             if data_cols:
+                for col in data_cols[:5]:  # Sprawdź pierwsze 5 kolumn
+                    non_null = df[col].notna().sum()
+                    print(f"{get_timestamp()} - [{fh_str}] DEBUG: {col}: {non_null}/{len(df)} wartości nie-NaN", flush=True)
+            
+            # Usuń wiersze z samymi NaN (poza lat/lon/run_time/forecast_time)
+            if data_cols:
                 df = df.dropna(subset=data_cols, how='all')
+            
+            # DEBUG: Sprawdź po usunięciu NaN
+            print(f"{get_timestamp()} - [{fh_str}] DEBUG: Po usunięciu NaN: {len(df)} wierszy", flush=True)
+            if len(df) > 0 and data_cols:
+                for col in data_cols[:5]:
+                    non_null = df[col].notna().sum()
+                    print(f"{get_timestamp()} - [{fh_str}] DEBUG: {col}: {non_null}/{len(df)} wartości nie-NaN", flush=True)
             
             records = df.to_dict('records')
             
             # Zwolnij pamięć
-            del ds_combined, df
+            del df
             import gc
             gc.collect()
             
@@ -633,11 +1316,16 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
                 df_final = pd.DataFrame(records)
                 
                 # Ostateczna walidacja kolumn przed zapisem - usuń wszystkie nieprawidłowe
+                import re
                 invalid_patterns = ['_m999', '_m0_', '_999_', '_999m', '_999mb', 'm999', 'm0', '_0m', '_0_mb']
                 invalid_cols = [c for c in df_final.columns if any(pattern in str(c).lower() for pattern in invalid_patterns)]
+                # Usuń wszystkie kolumny które kończą się na _m + liczba (np. _m0, _m1, _m999)
+                invalid_cols.extend([c for c in df_final.columns if re.search(r'_m\d+$', str(c))])
                 invalid_cols.extend([c for c in df_final.columns if '_999' in str(c).lower() and c not in invalid_cols])
+                # Usuń duplikaty
+                invalid_cols = list(set(invalid_cols))
                 if invalid_cols:
-                    print(f"{get_timestamp()} - [{fh_str}] ⚠ Ostateczne usuwanie nieprawidłowych kolumn przed zapisem: {invalid_cols}", flush=True)
+                    print(f"{get_timestamp()} - [{fh_str}] ⚠ Ostateczne usuwanie nieprawidłowych kolumn przed zapisem ({len(invalid_cols)}): {invalid_cols[:20]}...", flush=True)
                     df_final = df_final.drop(columns=invalid_cols)
                 
                 # Usuń również kolumny techniczne jeśli jeszcze są
@@ -659,7 +1347,11 @@ def process_grib_to_db_filtered(grib_path, run_time, forecast_hour, lat_min, lat
                 try:
                     df_final = pd.DataFrame(records)
                     # Usuń wszystkie kolumny które mogą powodować problemy
+                    import re
                     all_invalid = [c for c in df_final.columns if any(x in str(c).lower() for x in ['_m999', '_999', 'm999', '_m0', 'm0'])]
+                    # Usuń wszystkie kolumny które kończą się na _m + liczba
+                    all_invalid.extend([c for c in df_final.columns if re.search(r'_m\d+$', str(c))])
+                    all_invalid = list(set(all_invalid))
                     if all_invalid:
                         df_final = df_final.drop(columns=all_invalid)
                     df_final.to_sql('gfs_forecast', engine, if_exists='append', index=False, method='multi', chunksize=1000)
